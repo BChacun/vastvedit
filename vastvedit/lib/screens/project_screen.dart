@@ -493,7 +493,7 @@ class _ClipTile extends StatelessWidget {
 
 // ── Right panel ───────────────────────────────────────────────────────────────
 
-class _RightPanel extends StatelessWidget {
+class _RightPanel extends StatefulWidget {
   final double silenceThreshold;
   final double minSilenceDuration;
   final double padding;
@@ -527,52 +527,72 @@ class _RightPanel extends StatelessWidget {
   });
 
   @override
+  State<_RightPanel> createState() => _RightPanelState();
+}
+
+class _RightPanelState extends State<_RightPanel> {
+  final ScrollController _settingsScroll = ScrollController();
+
+  @override
+  void dispose() {
+    _settingsScroll.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    // Convenient shorthand so the body below can still read widget.* fields
+    final w = widget;
+
     return Container(
       color: AppColors.surface,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // Scrollable settings area
+          // ── Settings (scrollable, takes 3/5 of the panel height) ──────────
           Expanded(
-            flex: 0,
-            child: SingleChildScrollView(
-              child: Column(
+            flex: 3,
+            child: Scrollbar(
+              controller: _settingsScroll,
+              thumbVisibility: true,
+              child: SingleChildScrollView(
+                controller: _settingsScroll,
+                child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   // ── Silence settings ───────────────────────────────────────
                   _sectionHeader('Processing'),
                   _slider(
                     label: 'Silence threshold',
-                    value: silenceThreshold,
+                    value: w.silenceThreshold,
                     min: -60,
                     max: -10,
-                    display: '${silenceThreshold.round()} dB',
-                    onChanged: onThresholdChanged,
+                    display: '${w.silenceThreshold.round()} dB',
+                    onChanged: w.onThresholdChanged,
                   ),
                   _slider(
                     label: 'Min silence duration',
-                    value: minSilenceDuration,
+                    value: w.minSilenceDuration,
                     min: 0.1,
                     max: 3.0,
-                    display: '${minSilenceDuration.toStringAsFixed(1)} s',
-                    onChanged: onMinDurationChanged,
+                    display: '${w.minSilenceDuration.toStringAsFixed(1)} s',
+                    onChanged: w.onMinDurationChanged,
                   ),
                   _slider(
                     label: 'Context padding',
-                    value: padding,
+                    value: w.padding,
                     min: 0,
                     max: 0.5,
-                    display: '${padding.toStringAsFixed(2)} s',
-                    onChanged: onPaddingChanged,
+                    display: '${w.padding.toStringAsFixed(2)} s',
+                    onChanged: w.onPaddingChanged,
                   ),
 
                   const Divider(color: AppColors.border, height: 20),
 
                   // ── Subtitle panel ─────────────────────────────────────────
                   _SubtitlePanel(
-                    options: subtitles,
-                    onChanged: onSubtitlesChanged,
+                    options: w.subtitles,
+                    onChanged: w.onSubtitlesChanged,
                   ),
 
                   const Divider(color: AppColors.border, height: 20),
@@ -581,15 +601,15 @@ class _RightPanel extends StatelessWidget {
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16),
                     child: ElevatedButton.icon(
-                      icon: proc.stage == _Stage.processing
+                      icon: w.proc.stage == _Stage.processing
                           ? const SizedBox(
                               width: 16,
                               height: 16,
                               child: CircularProgressIndicator(
                                   strokeWidth: 2, color: Colors.white))
                           : const Icon(Icons.output),
-                      label: Text(proc.stage == _Stage.processing
-                          ? proc.statusMsg
+                      label: Text(w.proc.stage == _Stage.processing
+                          ? w.proc.statusMsg
                           : 'Process & Export'),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: AppColors.accent,
@@ -597,28 +617,30 @@ class _RightPanel extends StatelessWidget {
                         disabledBackgroundColor: AppColors.surface2,
                         padding: const EdgeInsets.symmetric(vertical: 14),
                       ),
-                      onPressed: clipCount == 0 ? null : onExport,
+                      onPressed: w.clipCount == 0 ? null : w.onExport,
                     ),
                   ),
                   const SizedBox(height: 8),
 
                   // ── Status ─────────────────────────────────────────────────
-                  if (proc.stage != _Stage.idle)
+                  if (w.proc.stage != _Stage.idle)
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 16),
-                      child: _StatusArea(proc: proc, onReset: onReset),
+                      child: _StatusArea(proc: w.proc, onReset: w.onReset),
                     ),
-                  const SizedBox(height: 8),
+                  const SizedBox(height: 16),
                 ],
-              ),
-            ),
-          ),
+                ),   // Column
+              ),     // SingleChildScrollView
+            ),       // Scrollbar
+          ),         // Expanded
 
           const Divider(color: AppColors.border, height: 1),
 
-          // ── Log (fixed at bottom, takes remaining space) ───────────────────
+          // ── Log (takes remaining 2/5 of panel height) ─────────────────────
           _sectionHeader('Log'),
           Expanded(
+            flex: 2,
             child: Container(
               margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
               padding: const EdgeInsets.all(10),
@@ -627,15 +649,15 @@ class _RightPanel extends StatelessWidget {
                 borderRadius: BorderRadius.circular(6),
                 border: Border.all(color: AppColors.border),
               ),
-              child: proc.logs.isEmpty
+              child: w.proc.logs.isEmpty
                   ? const Center(
                       child: Text('Processing log will appear here.',
                           style: TextStyle(color: AppColors.muted, fontSize: 11)))
                   : ListView.builder(
-                      controller: logScroll,
-                      itemCount: proc.logs.length,
+                      controller: w.logScroll,
+                      itemCount: w.proc.logs.length,
                       itemBuilder: (_, i) => Text(
-                        proc.logs[i],
+                        w.proc.logs[i],
                         style: const TextStyle(
                             color: Color(0xFF88CC88), fontSize: 10, fontFamily: 'monospace'),
                       ),
