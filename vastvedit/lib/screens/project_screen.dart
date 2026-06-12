@@ -8,6 +8,7 @@ import 'package:uuid/uuid.dart';
 import '../models/project.dart';
 import '../models/subtitle_options.dart';
 import '../providers/projects_provider.dart';
+import '../services/ffmpeg_service.dart';
 import '../services/whisper_service.dart';
 import 'home_screen.dart';
 
@@ -330,6 +331,7 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen> {
               subtitles: _subtitles,
               onSubtitlesChanged: (s) => setState(() => _subtitles = s),
               whisperService: ref.read(whisperServiceProvider),
+              ffmpegService: ref.read(ffmpegServiceProvider),
               // processing
               proc: _proc,
               onExport: _proc.stage == _Stage.processing ? null : _processAndExport,
@@ -506,6 +508,7 @@ class _RightPanel extends StatefulWidget {
   final SubtitleOptions subtitles;
   final ValueChanged<SubtitleOptions> onSubtitlesChanged;
   final WhisperService whisperService;
+  final FfmpegService ffmpegService;
 
   final _ProcessingState proc;
   final VoidCallback? onExport;
@@ -523,6 +526,7 @@ class _RightPanel extends StatefulWidget {
     required this.subtitles,
     required this.onSubtitlesChanged,
     required this.whisperService,
+    required this.ffmpegService,
     required this.proc,
     required this.onExport,
     required this.onReset,
@@ -598,6 +602,7 @@ class _RightPanelState extends State<_RightPanel> {
                     options: w.subtitles,
                     onChanged: w.onSubtitlesChanged,
                     whisperService: w.whisperService,
+                    ffmpegService: w.ffmpegService,
                   ),
 
                   const Divider(color: AppColors.border, height: 20),
@@ -658,13 +663,15 @@ class _RightPanelState extends State<_RightPanel> {
                   ? const Center(
                       child: Text('Processing log will appear here.',
                           style: TextStyle(color: AppColors.muted, fontSize: 11)))
-                  : ListView.builder(
-                      controller: w.logScroll,
-                      itemCount: w.proc.logs.length,
-                      itemBuilder: (_, i) => Text(
-                        w.proc.logs[i],
-                        style: const TextStyle(
-                            color: Color(0xFF88CC88), fontSize: 10, fontFamily: 'monospace'),
+                  : SelectionArea(
+                      child: ListView.builder(
+                        controller: w.logScroll,
+                        itemCount: w.proc.logs.length,
+                        itemBuilder: (_, i) => Text(
+                          w.proc.logs[i],
+                          style: const TextStyle(
+                              color: Color(0xFF88CC88), fontSize: 10, fontFamily: 'monospace'),
+                        ),
                       ),
                     ),
             ),
@@ -726,11 +733,13 @@ class _SubtitlePanel extends StatefulWidget {
   final SubtitleOptions options;
   final ValueChanged<SubtitleOptions> onChanged;
   final WhisperService whisperService;
+  final FfmpegService ffmpegService;
 
   const _SubtitlePanel({
     required this.options,
     required this.onChanged,
     required this.whisperService,
+    required this.ffmpegService,
   });
 
   @override
@@ -739,8 +748,9 @@ class _SubtitlePanel extends StatefulWidget {
 
 class _SubtitlePanelState extends State<_SubtitlePanel> {
   bool _expanded = false;
-  // null = still checking, true = installed, false = not found
+  // null = still checking, true = ok, false = not found/supported
   bool? _whisperAvailable;
+  bool? _ffmpegSubsAvailable;
 
   SubtitleOptions get _o => widget.options;
   void _update(SubtitleOptions next) => widget.onChanged(next);
@@ -755,17 +765,36 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
   @override
   void initState() {
     super.initState();
-    _checkWhisper();
+    _checkDeps();
   }
 
-  Future<void> _checkWhisper() async {
-    final available = await widget.whisperService.isAvailable;
-    if (mounted) setState(() => _whisperAvailable = available);
+  Future<void> _checkDeps() async {
+    final whisper = await widget.whisperService.isAvailable;
+    final subs    = await widget.ffmpegService.subtitlesAvailable;
+    if (mounted) {
+      setState(() {
+        _whisperAvailable    = whisper;
+        _ffmpegSubsAvailable = subs;
+      });
+    }
   }
 
   // Called when the user flips the subtitle toggle ON.
   Future<void> _onToggleOn() async {
-    // If we already know it's installed, just enable.
+    // Re-check ffmpeg subtitle support if needed.
+    final subsOk = _ffmpegSubsAvailable ?? await widget.ffmpegService.subtitlesAvailable;
+    if (mounted) setState(() => _ffmpegSubsAvailable = subsOk);
+
+    if (!subsOk) {
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (_) => _FfmpegFullDialog(),
+      );
+      return; // don't enable the toggle
+    }
+
+    // If we already know whisper is installed, just enable.
     if (_whisperAvailable == true) {
       _update(_o.copyWith(enabled: true));
       setState(() => _expanded = true);
@@ -802,8 +831,9 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
 
   @override
   Widget build(BuildContext context) {
-    final checking = _whisperAvailable == null;
-    final notInstalled = _whisperAvailable == false;
+    final checking      = _whisperAvailable == null || _ffmpegSubsAvailable == null;
+    final ffmpegMissing = _ffmpegSubsAvailable == false;
+    final notInstalled  = !ffmpegMissing && _whisperAvailable == false;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -823,12 +853,18 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
               ),
               const SizedBox(width: 6),
 
-              // Whisper status badge
+              // Status badge: spinner while checking, then one of three icons
               if (checking)
                 const SizedBox(
                   width: 10,
                   height: 10,
                   child: CircularProgressIndicator(strokeWidth: 1.5, color: AppColors.muted),
+                )
+              else if (ffmpegMissing)
+                Tooltip(
+                  message: 'ffmpeg-full required for subtitle burning — toggle on for details',
+                  child: Icon(Icons.error_outline_rounded,
+                      size: 14, color: AppColors.danger),
                 )
               else if (notInstalled)
                 Tooltip(
@@ -836,9 +872,9 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
                   child: Icon(Icons.warning_amber_rounded,
                       size: 14, color: AppColors.warning),
                 )
-              else if (_whisperAvailable == true)
+              else if (_whisperAvailable == true && _ffmpegSubsAvailable == true)
                 Tooltip(
-                  message: 'openai-whisper is installed',
+                  message: 'openai-whisper and ffmpeg subtitle support are ready',
                   child: Icon(Icons.check_circle_outline,
                       size: 14, color: AppColors.success),
                 ),
@@ -1140,6 +1176,121 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
       );
 }
 
+// ── ffmpeg-full required dialog ───────────────────────────────────────────────
+
+class _FfmpegFullDialog extends StatelessWidget {
+  const _FfmpegFullDialog();
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      backgroundColor: AppColors.surface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: SizedBox(
+        width: 460,
+        child: Padding(
+          padding: const EdgeInsets.all(28),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Title
+              Row(children: [
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: AppColors.danger.withAlpha(30),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Icon(Icons.extension_off_outlined,
+                      color: AppColors.danger, size: 24),
+                ),
+                const SizedBox(width: 16),
+                const Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('ffmpeg-full required',
+                          style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 16,
+                              fontWeight: FontWeight.bold)),
+                      SizedBox(height: 4),
+                      Text('Subtitle burning needs the libass codec',
+                          style: TextStyle(color: AppColors.muted, fontSize: 12)),
+                    ],
+                  ),
+                ),
+              ]),
+              const SizedBox(height: 20),
+
+              // Explanation
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: AppColors.surface2,
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: AppColors.border),
+                ),
+                child: const Text(
+                  'The standard "brew install ffmpeg" is compiled without '
+                  'libass (subtitle rendering). The ffmpeg-full formula '
+                  'includes it, along with many other codecs.',
+                  style: TextStyle(color: AppColors.subtle, fontSize: 12),
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Install command
+              const Text('Run this in Terminal, then restart VastEdit:',
+                  style: TextStyle(color: AppColors.muted, fontSize: 12)),
+              const SizedBox(height: 8),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0D0D0D),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: AppColors.border),
+                ),
+                child: const SelectableText(
+                  'brew install ffmpeg-full',
+                  style: TextStyle(
+                      color: Color(0xFF88CC88),
+                      fontSize: 13,
+                      fontFamily: 'monospace'),
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Note: ffmpeg-full is keg-only — it installs alongside the '
+                'standard ffmpeg and VastEdit will use it automatically.',
+                style: TextStyle(color: AppColors.muted, fontSize: 11),
+              ),
+              const SizedBox(height: 24),
+
+              // Close
+              Align(
+                alignment: Alignment.centerRight,
+                child: ElevatedButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppColors.accent,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 28, vertical: 12),
+                  ),
+                  child: const Text('Got it'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 // ── Whisper install dialog ────────────────────────────────────────────────────
 
 enum _InstallStage { confirm, installing, done, error }
@@ -1158,7 +1309,9 @@ class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
   String _installMethod = 'Detecting installer…';
   final List<String> _log = [];
   String? _errorMsg;
+  bool _showErrorLog = false;
   final ScrollController _logScroll = ScrollController();
+  final ScrollController _errorLogScroll = ScrollController();
 
   @override
   void initState() {
@@ -1169,6 +1322,7 @@ class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
   @override
   void dispose() {
     _logScroll.dispose();
+    _errorLogScroll.dispose();
     super.dispose();
   }
 
@@ -1197,6 +1351,7 @@ class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
     setState(() {
       _stage = _InstallStage.installing;
       _log.clear();
+      _showErrorLog = false;
     });
     try {
       await widget.service.install(onOutput: _appendLog);
@@ -1395,13 +1550,15 @@ class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
               border: Border.all(color: AppColors.border),
             ),
             padding: const EdgeInsets.all(10),
-            child: ListView.builder(
-              controller: _logScroll,
-              itemCount: _log.length,
-              itemBuilder: (_, i) => Text(
-                _log[i],
-                style: const TextStyle(
-                    color: Color(0xFF88CC88), fontSize: 10, fontFamily: 'monospace'),
+            child: SelectionArea(
+              child: ListView.builder(
+                controller: _logScroll,
+                itemCount: _log.length,
+                itemBuilder: (_, i) => Text(
+                  _log[i],
+                  style: const TextStyle(
+                      color: Color(0xFF88CC88), fontSize: 10, fontFamily: 'monospace'),
+                ),
               ),
             ),
           ),
@@ -1443,6 +1600,7 @@ class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Title
           const Row(
             children: [
               Icon(Icons.error_outline_rounded, color: AppColors.danger, size: 24),
@@ -1453,6 +1611,8 @@ class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
             ],
           ),
           const SizedBox(height: 16),
+
+          // Error message
           Container(
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
@@ -1460,12 +1620,77 @@ class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
               borderRadius: BorderRadius.circular(6),
               border: Border.all(color: AppColors.danger.withAlpha(60)),
             ),
-            child: Text(
+            child: SelectableText(
               _errorMsg ?? 'Unknown error',
-              style: const TextStyle(color: AppColors.danger, fontSize: 11, fontFamily: 'monospace'),
+              style: const TextStyle(
+                  color: AppColors.danger, fontSize: 11, fontFamily: 'monospace'),
             ),
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 12),
+
+          // Log toggle (only shown if there is log output)
+          if (_log.isNotEmpty) ...[
+            GestureDetector(
+              onTap: () {
+                setState(() => _showErrorLog = !_showErrorLog);
+                if (_showErrorLog) {
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (_errorLogScroll.hasClients) {
+                      _errorLogScroll
+                          .jumpTo(_errorLogScroll.position.maxScrollExtent);
+                    }
+                  });
+                }
+              },
+              child: Row(
+                children: [
+                  Icon(
+                    _showErrorLog
+                        ? Icons.keyboard_arrow_up
+                        : Icons.keyboard_arrow_down,
+                    size: 16,
+                    color: AppColors.muted,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    _showErrorLog ? 'Hide installation log' : 'Show installation log',
+                    style: const TextStyle(
+                        color: AppColors.muted,
+                        fontSize: 12,
+                        decoration: TextDecoration.underline),
+                  ),
+                ],
+              ),
+            ),
+            if (_showErrorLog) ...[
+              const SizedBox(height: 8),
+              Container(
+                height: 180,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0D0D0D),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: AppColors.border),
+                ),
+                padding: const EdgeInsets.all(10),
+                child: SelectionArea(
+                  child: ListView.builder(
+                    controller: _errorLogScroll,
+                    itemCount: _log.length,
+                    itemBuilder: (_, i) => Text(
+                      _log[i],
+                      style: const TextStyle(
+                          color: Color(0xFF88CC88),
+                          fontSize: 10,
+                          fontFamily: 'monospace'),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+            const SizedBox(height: 12),
+          ],
+
+          // Manual install fallback
           const Text('You can install it manually in Terminal:',
               style: TextStyle(color: AppColors.muted, fontSize: 12)),
           const SizedBox(height: 6),
@@ -1478,10 +1703,13 @@ class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
             ),
             child: const SelectableText(
               'pip3 install openai-whisper',
-              style: TextStyle(color: Color(0xFF88CC88), fontSize: 12, fontFamily: 'monospace'),
+              style: TextStyle(
+                  color: Color(0xFF88CC88), fontSize: 12, fontFamily: 'monospace'),
             ),
           ),
           const SizedBox(height: 24),
+
+          // Actions
           Row(
             mainAxisAlignment: MainAxisAlignment.end,
             children: [

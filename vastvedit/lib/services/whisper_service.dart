@@ -5,35 +5,61 @@ class WhisperService {
   String? _cachedPipPath;
   String? _cachedPipxPath;
 
+  // ── Shell helper ──────────────────────────────────────────────────────────
+
+  /// Runs [command] in a login shell so the user's full PATH (Homebrew,
+  /// pyenv, ~/.local/bin, etc.) is available — exactly as in Terminal.app.
+  Future<String?> _loginShellWhich(String command) async {
+    for (final shell in ['/bin/zsh', '/bin/bash']) {
+      try {
+        final r = await Process.run(shell, ['-l', '-c', 'which $command']);
+        if (r.exitCode == 0) {
+          final p = r.stdout.toString().trim().split('\n').first.trim();
+          if (p.isNotEmpty && await File(p).exists()) return p;
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
   // ── Binary detection ──────────────────────────────────────────────────────
 
   Future<String?> get executablePath async {
     if (_cachedWhisperPath != null) return _cachedWhisperPath;
 
     final home = Platform.environment['HOME'] ?? '';
-    final candidates = [
+
+    // 1. Fixed locations that don't depend on a Python version number.
+    final fixed = [
       '/opt/homebrew/bin/whisper',
       '/usr/local/bin/whisper',
-      '$home/.local/bin/whisper',          // pipx default
-      '$home/.local/pipx/venvs/openai-whisper/bin/whisper',
-      '$home/Library/Python/3.12/bin/whisper',
-      '$home/Library/Python/3.11/bin/whisper',
-      '$home/Library/Python/3.10/bin/whisper',
-      '$home/Library/Python/3.9/bin/whisper',
+      '$home/.local/bin/whisper', // pipx default
       '/usr/bin/whisper',
     ];
-
-    for (final p in candidates) {
+    for (final p in fixed) {
       if (await File(p).exists()) return _cachedWhisperPath = p;
     }
 
-    try {
-      final r = await Process.run('/usr/bin/which', ['whisper']);
-      if (r.exitCode == 0) {
-        final p = r.stdout.toString().trim();
-        if (p.isNotEmpty) return _cachedWhisperPath = p;
+    // 2. Dynamic scan of ~/Library/Python/<version>/bin/whisper.
+    //    Covers every Python version (3.9, 3.10, … 3.14, 3.15, …) without
+    //    hardcoding version numbers — pip --user always installs here on macOS.
+    final pyLibDir = Directory('$home/Library/Python');
+    if (await pyLibDir.exists()) {
+      final entries = await pyLibDir.list().toList();
+      // Sort descending so the newest version is tried first.
+      entries.sort((a, b) => b.path.compareTo(a.path));
+      for (final entry in entries) {
+        if (entry is Directory) {
+          final p = '${entry.path}/bin/whisper';
+          if (await File(p).exists()) return _cachedWhisperPath = p;
+        }
       }
-    } catch (_) {}
+    }
+
+    // 3. Login shell fallback — picks up the user's full PATH (Homebrew,
+    //    pyenv, conda, ~/.local/bin, etc.) exactly as Terminal.app does.
+    final found = await _loginShellWhich('whisper');
+    if (found != null) return _cachedWhisperPath = found;
 
     return null;
   }
@@ -52,18 +78,12 @@ class WhisperService {
       '/usr/local/bin/pip',
       '/usr/bin/pip3',
     ];
-
     for (final p in candidates) {
       if (await File(p).exists()) return _cachedPipPath = p;
     }
 
-    try {
-      final r = await Process.run('/usr/bin/which', ['pip3']);
-      if (r.exitCode == 0) {
-        final p = r.stdout.toString().trim();
-        if (p.isNotEmpty) return _cachedPipPath = p;
-      }
-    } catch (_) {}
+    final found = await _loginShellWhich('pip3') ?? await _loginShellWhich('pip');
+    if (found != null) return _cachedPipPath = found;
 
     return null;
   }
@@ -77,18 +97,12 @@ class WhisperService {
       '/usr/local/bin/pipx',
       '$home/.local/bin/pipx',
     ];
-
     for (final p in candidates) {
       if (await File(p).exists()) return _cachedPipxPath = p;
     }
 
-    try {
-      final r = await Process.run('/usr/bin/which', ['pipx']);
-      if (r.exitCode == 0) {
-        final p = r.stdout.toString().trim();
-        if (p.isNotEmpty) return _cachedPipxPath = p;
-      }
-    } catch (_) {}
+    final found = await _loginShellWhich('pipx');
+    if (found != null) return _cachedPipxPath = found;
 
     return null;
   }
@@ -98,7 +112,6 @@ class WhisperService {
 
   // ── Install strategy ──────────────────────────────────────────────────────
 
-  /// Returns a human-readable description of the install method that will be used.
   Future<String> get installMethodDescription async {
     if (await pipxPath != null) {
       return 'pipx install openai-whisper  (recommended — isolated environment)';
@@ -106,26 +119,19 @@ class WhisperService {
     if (await pipPath != null) {
       return 'pip3 install --break-system-packages --user openai-whisper';
     }
-    return 'No installer found';
+    return 'No installer found (install pipx or Python first)';
   }
 
-  /// Installs openai-whisper using the best available method:
-  ///   1. pipx          — cleanest, no environment conflicts
-  ///   2. pip3 --break-system-packages --user  — user-level, safe
-  ///   3. pip3 --break-system-packages         — system-wide, last resort
+  /// Installs openai-whisper using the best available method, then performs
+  /// a login-shell re-scan to locate the newly installed binary.
   Future<void> install({void Function(String)? onOutput}) async {
-    // Always reset cached path so re-detection runs after install.
-    _cachedWhisperPath = null;
+    _cachedWhisperPath = null; // force re-detection after install
 
     Future<int> run(String exe, List<String> args) async {
       onOutput?.call('\n▶ $exe ${args.join(' ')}\n');
       final process = await Process.start(exe, args);
-      process.stdout
-          .transform(const SystemEncoding().decoder)
-          .listen(onOutput);
-      process.stderr
-          .transform(const SystemEncoding().decoder)
-          .listen(onOutput);
+      process.stdout.transform(const SystemEncoding().decoder).listen(onOutput);
+      process.stderr.transform(const SystemEncoding().decoder).listen(onOutput);
       return process.exitCode;
     }
 
@@ -135,26 +141,26 @@ class WhisperService {
       onOutput?.call('Using pipx — the recommended installer for Homebrew Python.\n');
       final code = await run(pipx, ['install', 'openai-whisper']);
       if (code == 0) return;
-      onOutput?.call('\n⚠ pipx install failed — falling back to pip3…\n');
+      onOutput?.call('\n⚠ pipx failed — falling back to pip3…\n');
     }
 
-    // ── Strategy 2 & 3: pip3 ─────────────────────────────────────────────
+    // ── Strategy 2: pip3 --break-system-packages --user ───────────────────
     final pip = await pipPath;
     if (pip == null) {
       throw Exception(
         'No Python installer found (tried pipx and pip3).\n\n'
         'Install one of:\n'
-        '  brew install pipx   (recommended)\n'
+        '  brew install pipx   ← recommended\n'
         '  brew install python',
       );
     }
 
-    // 2. --break-system-packages --user  (safe: user-level only)
-    onOutput?.call('Trying pip3 with --break-system-packages --user…\n');
-    var code = await run(pip, ['install', '--break-system-packages', '--user', 'openai-whisper']);
+    onOutput?.call('Trying pip3 --break-system-packages --user…\n');
+    var code = await run(
+        pip, ['install', '--break-system-packages', '--user', 'openai-whisper']);
     if (code == 0) return;
 
-    // 3. --break-system-packages (system-wide, last resort)
+    // ── Strategy 3: pip3 --break-system-packages (system-wide) ───────────
     onOutput?.call('\n⚠ User install failed — trying system-wide…\n');
     code = await run(pip, ['install', '--break-system-packages', 'openai-whisper']);
     if (code == 0) return;

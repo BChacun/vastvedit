@@ -69,35 +69,37 @@ class SubtitleStyle {
         position: position ?? this.position,
       );
 
-  /// Builds the ASS `force_style` string consumed by ffmpeg's `subtitles` filter.
-  String toForceStyle() {
+  /// Returns a full ASS [V4+ Styles] line with all style properties embedded.
+  ///
+  /// Used instead of the `force_style` ffmpeg filter option, which breaks
+  /// consistently in Homebrew ffmpeg 7.x regardless of quoting/escaping.
+  /// By embedding styles directly in the .ass file we avoid the filter-string
+  /// parser entirely.
+  String toAssStyleLine() {
     final fg = _assColor(fontColor, alpha: 0);
-    final outline = _assColor(const Color(0xFF000000), alpha: 0);
-
-    // ASS alpha: 0x00 = opaque, 0xFF = transparent
+    const secondary = '&H000000FF'; // unused (karaoke), standard default
+    final ol = _assColor(const Color(0xFF000000), alpha: 0);
     final bgAlpha = hasBackground
         ? ((1.0 - backgroundOpacity) * 255).round().clamp(0, 255)
         : 255;
     final back = _assColor(const Color(0xFF000000), alpha: bgAlpha);
-
-    // BorderStyle 3 = opaque/translucent box; 1 = outline only
     final borderStyle = hasBackground ? 3 : 1;
     final outlineWidth = hasOutline ? 2 : 0;
 
-    return [
-      'FontName=Arial',
-      'FontSize=${fontSize.round()}',
-      'PrimaryColour=$fg',
-      'OutlineColour=$outline',
-      'BackColour=$back',
-      'Outline=$outlineWidth',
-      'Shadow=0',
-      'BorderStyle=$borderStyle',
-      'Alignment=${position.assAlignment}',
-      'MarginV=28',
-      'MarginL=16',
-      'MarginR=16',
-    ].join(',');
+    // ASS Style field order:
+    // Name, Fontname, Fontsize,
+    // PrimaryColour, SecondaryColour, OutlineColour, BackColour,
+    // Bold, Italic, Underline, StrikeOut,
+    // ScaleX, ScaleY, Spacing, Angle,
+    // BorderStyle, Outline, Shadow,
+    // Alignment, MarginL, MarginR, MarginV, Encoding
+    return 'Style: Default,'
+        'Arial,${fontSize.round()},'
+        '$fg,$secondary,$ol,$back,'
+        '0,0,0,0,'
+        '100,100,0,0,'
+        '$borderStyle,$outlineWidth,0,'
+        '${position.assAlignment},16,16,28,1';
   }
 }
 
