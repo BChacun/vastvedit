@@ -3,10 +3,10 @@ import 'dart:io';
 class WhisperService {
   String? _cachedWhisperPath;
   String? _cachedPipPath;
+  String? _cachedPipxPath;
 
-  // ── Whisper detection ─────────────────────────────────────────────────────
+  // ── Binary detection ──────────────────────────────────────────────────────
 
-  /// Absolute path to the `whisper` binary, or `null` if not installed.
   Future<String?> get executablePath async {
     if (_cachedWhisperPath != null) return _cachedWhisperPath;
 
@@ -14,7 +14,8 @@ class WhisperService {
     final candidates = [
       '/opt/homebrew/bin/whisper',
       '/usr/local/bin/whisper',
-      '$home/.local/bin/whisper',
+      '$home/.local/bin/whisper',          // pipx default
+      '$home/.local/pipx/venvs/openai-whisper/bin/whisper',
       '$home/Library/Python/3.12/bin/whisper',
       '$home/Library/Python/3.11/bin/whisper',
       '$home/Library/Python/3.10/bin/whisper',
@@ -39,9 +40,6 @@ class WhisperService {
 
   Future<bool> get isAvailable async => (await executablePath) != null;
 
-  // ── pip detection ─────────────────────────────────────────────────────────
-
-  /// Absolute path to `pip3`, or `null` if Python / pip are not found.
   Future<String?> get pipPath async {
     if (_cachedPipPath != null) return _cachedPipPath;
 
@@ -70,58 +68,103 @@ class WhisperService {
     return null;
   }
 
-  Future<bool> get canInstall async => (await pipPath) != null;
+  Future<String?> get pipxPath async {
+    if (_cachedPipxPath != null) return _cachedPipxPath;
 
-  // ── Installation ──────────────────────────────────────────────────────────
+    final home = Platform.environment['HOME'] ?? '';
+    final candidates = [
+      '/opt/homebrew/bin/pipx',
+      '/usr/local/bin/pipx',
+      '$home/.local/bin/pipx',
+    ];
 
-  /// Installs `openai-whisper` via pip and streams output to [onOutput].
-  ///
-  /// Tries a plain install first; retries with `--user` if the environment is
-  /// "externally managed" (PEP 668 / macOS system Python).
-  ///
-  /// Throws an [Exception] with a human-readable message on failure.
-  Future<void> install({void Function(String)? onOutput}) async {
-    final pip = await pipPath;
-    if (pip == null) {
-      throw Exception(
-        'pip3 not found.\n'
-        'Install Python 3 via Homebrew:  brew install python\n'
-        'or download it from https://python.org',
-      );
+    for (final p in candidates) {
+      if (await File(p).exists()) return _cachedPipxPath = p;
     }
 
-    Future<int> runPip(List<String> args) async {
-      onOutput?.call('▶ $pip ${args.join(' ')}\n');
-      final process = await Process.start(pip, args);
+    try {
+      final r = await Process.run('/usr/bin/which', ['pipx']);
+      if (r.exitCode == 0) {
+        final p = r.stdout.toString().trim();
+        if (p.isNotEmpty) return _cachedPipxPath = p;
+      }
+    } catch (_) {}
+
+    return null;
+  }
+
+  Future<bool> get canInstall async =>
+      (await pipxPath) != null || (await pipPath) != null;
+
+  // ── Install strategy ──────────────────────────────────────────────────────
+
+  /// Returns a human-readable description of the install method that will be used.
+  Future<String> get installMethodDescription async {
+    if (await pipxPath != null) {
+      return 'pipx install openai-whisper  (recommended — isolated environment)';
+    }
+    if (await pipPath != null) {
+      return 'pip3 install --break-system-packages --user openai-whisper';
+    }
+    return 'No installer found';
+  }
+
+  /// Installs openai-whisper using the best available method:
+  ///   1. pipx          — cleanest, no environment conflicts
+  ///   2. pip3 --break-system-packages --user  — user-level, safe
+  ///   3. pip3 --break-system-packages         — system-wide, last resort
+  Future<void> install({void Function(String)? onOutput}) async {
+    // Always reset cached path so re-detection runs after install.
+    _cachedWhisperPath = null;
+
+    Future<int> run(String exe, List<String> args) async {
+      onOutput?.call('\n▶ $exe ${args.join(' ')}\n');
+      final process = await Process.start(exe, args);
       process.stdout
           .transform(const SystemEncoding().decoder)
-          .listen((s) => onOutput?.call(s));
+          .listen(onOutput);
       process.stderr
           .transform(const SystemEncoding().decoder)
-          .listen((s) => onOutput?.call(s));
+          .listen(onOutput);
       return process.exitCode;
     }
 
-    // First attempt
-    var code = await runPip(['install', 'openai-whisper']);
-
-    // If it failed due to an externally-managed environment (PEP 668), retry
-    // with --user
-    if (code != 0) {
-      onOutput?.call('\n⚠ Standard install failed — retrying with --user flag…\n');
-      code = await runPip(['install', '--user', 'openai-whisper']);
+    // ── Strategy 1: pipx ─────────────────────────────────────────────────
+    final pipx = await pipxPath;
+    if (pipx != null) {
+      onOutput?.call('Using pipx — the recommended installer for Homebrew Python.\n');
+      final code = await run(pipx, ['install', 'openai-whisper']);
+      if (code == 0) return;
+      onOutput?.call('\n⚠ pipx install failed — falling back to pip3…\n');
     }
 
-    if (code != 0) {
+    // ── Strategy 2 & 3: pip3 ─────────────────────────────────────────────
+    final pip = await pipPath;
+    if (pip == null) {
       throw Exception(
-        'pip install failed (exit code $code).\n'
-        'Try running manually in Terminal:\n'
-        '  pip3 install openai-whisper',
+        'No Python installer found (tried pipx and pip3).\n\n'
+        'Install one of:\n'
+        '  brew install pipx   (recommended)\n'
+        '  brew install python',
       );
     }
 
-    // Invalidate cached path so the next isAvailable check re-scans
-    _cachedWhisperPath = null;
+    // 2. --break-system-packages --user  (safe: user-level only)
+    onOutput?.call('Trying pip3 with --break-system-packages --user…\n');
+    var code = await run(pip, ['install', '--break-system-packages', '--user', 'openai-whisper']);
+    if (code == 0) return;
+
+    // 3. --break-system-packages (system-wide, last resort)
+    onOutput?.call('\n⚠ User install failed — trying system-wide…\n');
+    code = await run(pip, ['install', '--break-system-packages', 'openai-whisper']);
+    if (code == 0) return;
+
+    throw Exception(
+      'All install attempts failed.\n\n'
+      'Try installing pipx first, then retry:\n'
+      '  brew install pipx\n'
+      '  pipx install openai-whisper',
+    );
   }
 
   // ── Transcription ─────────────────────────────────────────────────────────
@@ -137,7 +180,7 @@ class WhisperService {
     if (exe == null) {
       throw Exception(
         'openai-whisper is not installed.\n'
-        'Enable Subtitles in the panel to install it automatically.',
+        'Enable the Subtitles toggle to install it automatically.',
       );
     }
 

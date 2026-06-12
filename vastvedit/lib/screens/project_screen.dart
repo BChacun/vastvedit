@@ -1154,7 +1154,8 @@ class _WhisperInstallDialog extends StatefulWidget {
 
 class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
   _InstallStage _stage = _InstallStage.confirm;
-  bool _pipAvailable = true; // assume true until checked
+  bool _canInstall = true;
+  String _installMethod = 'Detecting installer…';
   final List<String> _log = [];
   String? _errorMsg;
   final ScrollController _logScroll = ScrollController();
@@ -1162,7 +1163,7 @@ class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
   @override
   void initState() {
     super.initState();
-    _checkPip();
+    _detectInstaller();
   }
 
   @override
@@ -1171,9 +1172,15 @@ class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
     super.dispose();
   }
 
-  Future<void> _checkPip() async {
-    final available = await widget.service.canInstall;
-    if (mounted) setState(() => _pipAvailable = available);
+  Future<void> _detectInstaller() async {
+    final canInstall = await widget.service.canInstall;
+    final method = await widget.service.installMethodDescription;
+    if (mounted) {
+      setState(() {
+        _canInstall = canInstall;
+        _installMethod = method;
+      });
+    }
   }
 
   void _appendLog(String s) {
@@ -1275,10 +1282,38 @@ class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
           _infoRow(Icons.storage_outlined, 'Download size',
               'Package: ~10 MB.  AI model weights are downloaded on first use (e.g. small model: ~250 MB).'),
           const SizedBox(height: 12),
-          _infoRow(Icons.terminal_outlined, 'How it installs',
-              'Runs:  pip3 install openai-whisper'),
-          if (!_pipAvailable) ...[
-            const SizedBox(height: 16),
+          _infoRow(Icons.terminal_outlined, 'Install command',
+              _installMethod),
+          const SizedBox(height: 16),
+          // Strategy explanation box
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: AppColors.surface2,
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: AppColors.border),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Install strategy',
+                    style: TextStyle(
+                        color: AppColors.subtle,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600)),
+                const SizedBox(height: 6),
+                const Text(
+                  '1. pipx  (preferred — isolated, no system conflicts)\n'
+                  '2. pip3 --break-system-packages --user  (user-level)\n'
+                  '3. pip3 --break-system-packages  (system-wide fallback)',
+                  style: TextStyle(
+                      color: AppColors.muted, fontSize: 11, fontFamily: 'monospace'),
+                ),
+              ],
+            ),
+          ),
+          if (!_canInstall) ...[
+            const SizedBox(height: 12),
             Container(
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
@@ -1287,12 +1322,18 @@ class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
                 border: Border.all(color: AppColors.warning.withAlpha(60)),
               ),
               child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Icon(Icons.warning_amber_rounded, color: AppColors.warning, size: 16),
+                  const Icon(Icons.warning_amber_rounded,
+                      color: AppColors.warning, size: 16),
                   const SizedBox(width: 8),
                   const Expanded(
                     child: Text(
-                      'pip3 not found.  Install Python 3 first:\n  brew install python',
+                      'Neither pipx nor pip3 were found.\n\n'
+                      'Install pipx first (recommended):\n'
+                      '  brew install pipx\n\n'
+                      'Or install Python:\n'
+                      '  brew install python',
                       style: TextStyle(color: AppColors.warning, fontSize: 11),
                     ),
                   ),
@@ -1300,7 +1341,7 @@ class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
               ),
             ),
           ],
-          const SizedBox(height: 28),
+          const SizedBox(height: 24),
           Row(
             mainAxisAlignment: MainAxisAlignment.end,
             children: [
@@ -1317,7 +1358,7 @@ class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
                   foregroundColor: Colors.white,
                   padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
                 ),
-                onPressed: _pipAvailable ? _install : null,
+                onPressed: _canInstall ? _install : null,
               ),
             ],
           ),
