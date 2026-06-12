@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 
 import '../models/project.dart';
+import '../models/subtitle_options.dart';
 import '../providers/projects_provider.dart';
 import 'home_screen.dart';
 
@@ -55,15 +56,18 @@ class ProjectScreen extends ConsumerStatefulWidget {
 }
 
 class _ProjectScreenState extends ConsumerState<ProjectScreen> {
-  // Settings
+  // ── Silence settings ───────────────────────────────────────────────────────
   double _silenceThreshold = -30.0;
   double _minSilenceDuration = 0.5;
   double _padding = 0.1;
 
-  // Cached durations (clipId → seconds)
+  // ── Subtitle settings ──────────────────────────────────────────────────────
+  SubtitleOptions _subtitles = const SubtitleOptions();
+
+  // ── Cached clip durations ──────────────────────────────────────────────────
   final Map<String, double> _durations = {};
 
-  // Processing
+  // ── Processing ─────────────────────────────────────────────────────────────
   _ProcessingState _proc = const _ProcessingState();
   final ScrollController _logScroll = ScrollController();
 
@@ -87,9 +91,7 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen> {
 
   void _log(String msg) {
     if (!mounted) return;
-    setState(() {
-      _proc = _proc.copyWith(logs: [..._proc.logs, msg]);
-    });
+    setState(() => _proc = _proc.copyWith(logs: [..._proc.logs, msg]));
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_logScroll.hasClients) {
         _logScroll.jumpTo(_logScroll.position.maxScrollExtent);
@@ -100,8 +102,7 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen> {
   void _loadDuration(Clip clip) async {
     if (_durations.containsKey(clip.id)) return;
     try {
-      final ff = ref.read(ffmpegServiceProvider);
-      final d = await ff.getVideoDuration(clip.filePath);
+      final d = await ref.read(ffmpegServiceProvider).getVideoDuration(clip.filePath);
       if (mounted) setState(() => _durations[clip.id] = d);
     } catch (_) {}
   }
@@ -137,8 +138,9 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen> {
   Future<void> _removeClip(Clip clip) async {
     final project = _project;
     if (project == null) return;
-    final clips = project.clips.where((c) => c.id != clip.id).toList();
-    await ref.read(projectsProvider.notifier).save(project.copyWith(clips: clips));
+    await ref.read(projectsProvider.notifier).save(
+          project.copyWith(clips: project.clips.where((c) => c.id != clip.id).toList()),
+        );
   }
 
   Future<void> _reorderClips(int oldIndex, int newIndex) async {
@@ -146,8 +148,7 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen> {
     if (project == null) return;
     final clips = [...project.clips];
     if (newIndex > oldIndex) newIndex -= 1;
-    final item = clips.removeAt(oldIndex);
-    clips.insert(newIndex, item);
+    clips.insert(newIndex, clips.removeAt(oldIndex));
     await ref.read(projectsProvider.notifier).save(project.copyWith(clips: clips));
   }
 
@@ -165,18 +166,15 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen> {
           style: const TextStyle(color: Colors.white),
           autofocus: true,
           decoration: const InputDecoration(
-            enabledBorder:
-                UnderlineInputBorder(borderSide: BorderSide(color: AppColors.border)),
-            focusedBorder:
-                UnderlineInputBorder(borderSide: BorderSide(color: AppColors.accent)),
+            enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: AppColors.border)),
+            focusedBorder: UnderlineInputBorder(borderSide: BorderSide(color: AppColors.accent)),
           ),
           onSubmitted: (v) => Navigator.of(context).pop(v),
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Cancel', style: TextStyle(color: AppColors.muted)),
-          ),
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel', style: TextStyle(color: AppColors.muted))),
           ElevatedButton(
             onPressed: () => Navigator.of(context).pop(controller.text),
             style: ElevatedButton.styleFrom(backgroundColor: AppColors.accent),
@@ -189,7 +187,7 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen> {
     await ref.read(projectsProvider.notifier).save(project.copyWith(name: name.trim()));
   }
 
-  // ── Processing ─────────────────────────────────────────────────────────────
+  // ── Export ─────────────────────────────────────────────────────────────────
 
   Future<void> _processAndExport() async {
     final project = _project;
@@ -212,20 +210,28 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen> {
 
     try {
       final ffmpeg = ref.read(ffmpegServiceProvider);
+      final whisper = _subtitles.enabled ? ref.read(whisperServiceProvider) : null;
+
       await ffmpeg.processProject(
         project: project,
         outputPath: outputPath,
         silenceThreshold: _silenceThreshold,
         minSilenceDuration: _minSilenceDuration,
         padding: _padding,
+        subtitles: _subtitles,
+        whisperService: whisper,
         onLog: _log,
         onProgress: (p) {
           if (!mounted) return;
           setState(() {
-            _proc = _proc.copyWith(
-              progress: p,
-              statusMsg: p < 0.86 ? 'Processing clips…' : 'Stitching…',
-            );
+            final msg = p < 0.78
+                ? 'Processing clips…'
+                : p < 0.82
+                    ? 'Stitching…'
+                    : p < 0.92
+                        ? 'Transcribing audio…'
+                        : 'Burning subtitles…';
+            _proc = _proc.copyWith(progress: p, statusMsg: msg);
           });
         },
       );
@@ -241,40 +247,30 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen> {
       });
     } catch (e) {
       if (!mounted) return;
-      setState(() {
-        _proc = _proc.copyWith(
-          stage: _Stage.error,
-          statusMsg: 'Error: $e',
-        );
-      });
+      setState(() => _proc = _proc.copyWith(stage: _Stage.error, statusMsg: 'Error: $e'));
       _log('ERROR: $e');
     }
   }
 
-  void _showSnack(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), backgroundColor: AppColors.surface2),
-    );
-  }
+  void _showSnack(String msg) => ScaffoldMessenger.of(context)
+      .showSnackBar(SnackBar(content: Text(msg), backgroundColor: AppColors.surface2));
 
   // ── Build ──────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
-    final async = ref.watch(projectsProvider);
-    final project = async.value?.cast<Project?>().firstWhere(
+    final project = ref.watch(projectsProvider).value?.cast<Project?>().firstWhere(
           (p) => p?.id == widget.projectId,
           orElse: () => null,
         );
 
     if (project == null) {
-      return Scaffold(
+      return const Scaffold(
         backgroundColor: AppColors.bg,
-        body: const Center(child: CircularProgressIndicator()),
+        body: Center(child: CircularProgressIndicator()),
       );
     }
 
-    // Kick off duration loads
     for (final clip in project.clips) {
       _loadDuration(clip);
     }
@@ -304,36 +300,35 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen> {
       body: Row(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // ── Left: clip list ──────────────────────────────────────────────
+          // ── Clip list ──────────────────────────────────────────────────────
           Expanded(
             flex: 6,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                _ClipListHeader(
-                  count: project.clips.length,
-                  onImport: _processAndExport.runtimeType == _processAndExport.runtimeType
-                      ? _importVideos
-                      : null,
-                ),
+                _ClipListHeader(count: project.clips.length, onImport: _importVideos),
                 Expanded(child: _buildClipList(project)),
               ],
             ),
           ),
 
-          // ── Divider ──────────────────────────────────────────────────────
           const VerticalDivider(width: 1, color: AppColors.border),
 
-          // ── Right: settings + output ──────────────────────────────────────
+          // ── Right panel ────────────────────────────────────────────────────
           SizedBox(
-            width: 320,
+            width: 330,
             child: _RightPanel(
+              // silence
               silenceThreshold: _silenceThreshold,
               minSilenceDuration: _minSilenceDuration,
               padding: _padding,
               onThresholdChanged: (v) => setState(() => _silenceThreshold = v),
               onMinDurationChanged: (v) => setState(() => _minSilenceDuration = v),
               onPaddingChanged: (v) => setState(() => _padding = v),
+              // subtitles
+              subtitles: _subtitles,
+              onSubtitlesChanged: (s) => setState(() => _subtitles = s),
+              // processing
               proc: _proc,
               onExport: _proc.stage == _Stage.processing ? null : _processAndExport,
               onReset: () => setState(() => _proc = const _ProcessingState()),
@@ -360,9 +355,7 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen> {
               icon: const Icon(Icons.add),
               label: const Text('Import Videos'),
               style: ElevatedButton.styleFrom(
-                backgroundColor: AppColors.accent,
-                foregroundColor: Colors.white,
-              ),
+                  backgroundColor: AppColors.accent, foregroundColor: Colors.white),
               onPressed: _importVideos,
             ),
           ],
@@ -373,22 +366,21 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen> {
     return ReorderableListView.builder(
       padding: const EdgeInsets.symmetric(vertical: 8),
       onReorder: _reorderClips,
-      itemCount: project.clips.length,
       proxyDecorator: (child, index, animation) => Material(
         color: AppColors.surface2,
         borderRadius: BorderRadius.circular(6),
         elevation: 6,
         child: child,
       ),
+      itemCount: project.clips.length,
       itemBuilder: (_, i) {
         final clip = project.clips[i];
-        final exists = File(clip.filePath).existsSync();
         return _ClipTile(
           key: ValueKey(clip.id),
           clip: clip,
           index: i,
           duration: _durations[clip.id],
-          fileExists: exists,
+          fileExists: File(clip.filePath).existsSync(),
           onDelete: () => _removeClip(clip),
         );
       },
@@ -401,31 +393,26 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen> {
 class _ClipListHeader extends StatelessWidget {
   final int count;
   final VoidCallback? onImport;
-
   const _ClipListHeader({required this.count, this.onImport});
 
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      color: AppColors.surface,
-      child: Row(
-        children: [
-          Text(
-            '$count clip${count == 1 ? '' : 's'}',
-            style: const TextStyle(color: AppColors.subtle, fontSize: 13),
-          ),
-          const Spacer(),
-          TextButton.icon(
-            icon: const Icon(Icons.add, size: 16),
-            label: const Text('Import Videos'),
-            style: TextButton.styleFrom(foregroundColor: AppColors.accent),
-            onPressed: onImport,
-          ),
-        ],
-      ),
-    );
-  }
+  Widget build(BuildContext context) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        color: AppColors.surface,
+        child: Row(
+          children: [
+            Text('$count clip${count == 1 ? '' : 's'}',
+                style: const TextStyle(color: AppColors.subtle, fontSize: 13)),
+            const Spacer(),
+            TextButton.icon(
+              icon: const Icon(Icons.add, size: 16),
+              label: const Text('Import Videos'),
+              style: TextButton.styleFrom(foregroundColor: AppColors.accent),
+              onPressed: onImport,
+            ),
+          ],
+        ),
+      );
 }
 
 // ── Clip tile ─────────────────────────────────────────────────────────────────
@@ -447,77 +434,61 @@ class _ClipTile extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(
-          color: fileExists ? AppColors.border : AppColors.danger.withAlpha(100),
+  Widget build(BuildContext context) => Container(
+        margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+        decoration: BoxDecoration(
+          color: AppColors.surface,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+              color: fileExists ? AppColors.border : AppColors.danger.withAlpha(100)),
         ),
-      ),
-      child: ListTile(
-        dense: true,
-        leading: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.drag_handle, color: AppColors.muted, size: 18),
-            const SizedBox(width: 8),
-            Container(
-              width: 28,
-              height: 28,
-              decoration: BoxDecoration(
-                color: AppColors.surface2,
-                borderRadius: BorderRadius.circular(4),
+        child: ListTile(
+          dense: true,
+          leading: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.drag_handle, color: AppColors.muted, size: 18),
+              const SizedBox(width: 8),
+              Container(
+                width: 26,
+                height: 26,
+                decoration: BoxDecoration(
+                    color: AppColors.surface2, borderRadius: BorderRadius.circular(4)),
+                child: Center(
+                    child: Text('${index + 1}',
+                        style: const TextStyle(color: AppColors.subtle, fontSize: 11))),
               ),
-              child: Center(
-                child: Text(
-                  '${index + 1}',
-                  style: const TextStyle(color: AppColors.subtle, fontSize: 11),
-                ),
+              const SizedBox(width: 10),
+              Icon(
+                fileExists ? Icons.movie_outlined : Icons.broken_image_outlined,
+                color: fileExists ? AppColors.accent : AppColors.danger,
+                size: 18,
               ),
-            ),
-            const SizedBox(width: 10),
-            Icon(
-              fileExists ? Icons.movie_outlined : Icons.broken_image_outlined,
-              color: fileExists ? AppColors.accent : AppColors.danger,
-              size: 18,
-            ),
-          ],
-        ),
-        title: Text(
-          clip.name,
-          style: TextStyle(
-            color: fileExists ? Colors.white : AppColors.danger,
-            fontSize: 13,
+            ],
           ),
-          overflow: TextOverflow.ellipsis,
-        ),
-        subtitle: Text(
-          fileExists
-              ? (duration != null ? _fmtDuration(duration!) : clip.filePath.split('/').last)
-              : 'File not found',
-          style: TextStyle(
-            color: fileExists ? AppColors.muted : AppColors.danger.withAlpha(180),
-            fontSize: 11,
+          title: Text(clip.name,
+              style:
+                  TextStyle(color: fileExists ? Colors.white : AppColors.danger, fontSize: 13),
+              overflow: TextOverflow.ellipsis),
+          subtitle: Text(
+            fileExists
+                ? (duration != null ? _fmtDuration(duration!) : clip.filePath.split('/').last)
+                : 'File not found',
+            style: TextStyle(
+                color: fileExists ? AppColors.muted : AppColors.danger.withAlpha(180),
+                fontSize: 11),
+            overflow: TextOverflow.ellipsis,
           ),
-          overflow: TextOverflow.ellipsis,
+          trailing: IconButton(
+            icon: const Icon(Icons.close, color: AppColors.muted, size: 16),
+            tooltip: 'Remove clip',
+            onPressed: onDelete,
+          ),
         ),
-        trailing: IconButton(
-          icon: const Icon(Icons.close, color: AppColors.muted, size: 16),
-          tooltip: 'Remove clip',
-          onPressed: onDelete,
-        ),
-      ),
-    );
-  }
+      );
 
-  String _fmtDuration(double s) {
-    final m = s ~/ 60;
-    final sec = (s % 60).toStringAsFixed(1);
-    return '${m}m ${sec}s';
-  }
+  String _fmtDuration(double s) =>
+      '${(s ~/ 60)}m ${(s % 60).toStringAsFixed(1)}s';
 }
 
 // ── Right panel ───────────────────────────────────────────────────────────────
@@ -529,6 +500,10 @@ class _RightPanel extends StatelessWidget {
   final ValueChanged<double> onThresholdChanged;
   final ValueChanged<double> onMinDurationChanged;
   final ValueChanged<double> onPaddingChanged;
+
+  final SubtitleOptions subtitles;
+  final ValueChanged<SubtitleOptions> onSubtitlesChanged;
+
   final _ProcessingState proc;
   final VoidCallback? onExport;
   final VoidCallback onReset;
@@ -542,6 +517,8 @@ class _RightPanel extends StatelessWidget {
     required this.onThresholdChanged,
     required this.onMinDurationChanged,
     required this.onPaddingChanged,
+    required this.subtitles,
+    required this.onSubtitlesChanged,
     required this.proc,
     required this.onExport,
     required this.onReset,
@@ -556,64 +533,94 @@ class _RightPanel extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _section('Processing Settings'),
-          _slider(
-            label: 'Silence threshold',
-            value: silenceThreshold,
-            min: -60,
-            max: -10,
-            display: '${silenceThreshold.round()} dB',
-            onChanged: onThresholdChanged,
-          ),
-          _slider(
-            label: 'Min silence duration',
-            value: minSilenceDuration,
-            min: 0.1,
-            max: 3.0,
-            display: '${minSilenceDuration.toStringAsFixed(1)} s',
-            onChanged: onMinDurationChanged,
-          ),
-          _slider(
-            label: 'Context padding',
-            value: padding,
-            min: 0,
-            max: 0.5,
-            display: '${padding.toStringAsFixed(2)} s',
-            onChanged: onPaddingChanged,
-          ),
-          const Divider(color: AppColors.border, height: 24),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: ElevatedButton.icon(
-              icon: proc.stage == _Stage.processing
-                  ? const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(
-                          strokeWidth: 2, color: Colors.white))
-                  : const Icon(Icons.output),
-              label: Text(proc.stage == _Stage.processing ? 'Processing…' : 'Process & Export'),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: AppColors.accent,
-                foregroundColor: Colors.white,
-                disabledBackgroundColor: AppColors.surface2,
-                padding: const EdgeInsets.symmetric(vertical: 14),
+          // Scrollable settings area
+          Expanded(
+            flex: 0,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  // ── Silence settings ───────────────────────────────────────
+                  _sectionHeader('Processing'),
+                  _slider(
+                    label: 'Silence threshold',
+                    value: silenceThreshold,
+                    min: -60,
+                    max: -10,
+                    display: '${silenceThreshold.round()} dB',
+                    onChanged: onThresholdChanged,
+                  ),
+                  _slider(
+                    label: 'Min silence duration',
+                    value: minSilenceDuration,
+                    min: 0.1,
+                    max: 3.0,
+                    display: '${minSilenceDuration.toStringAsFixed(1)} s',
+                    onChanged: onMinDurationChanged,
+                  ),
+                  _slider(
+                    label: 'Context padding',
+                    value: padding,
+                    min: 0,
+                    max: 0.5,
+                    display: '${padding.toStringAsFixed(2)} s',
+                    onChanged: onPaddingChanged,
+                  ),
+
+                  const Divider(color: AppColors.border, height: 20),
+
+                  // ── Subtitle panel ─────────────────────────────────────────
+                  _SubtitlePanel(
+                    options: subtitles,
+                    onChanged: onSubtitlesChanged,
+                  ),
+
+                  const Divider(color: AppColors.border, height: 20),
+
+                  // ── Export button ──────────────────────────────────────────
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: ElevatedButton.icon(
+                      icon: proc.stage == _Stage.processing
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                  strokeWidth: 2, color: Colors.white))
+                          : const Icon(Icons.output),
+                      label: Text(proc.stage == _Stage.processing
+                          ? proc.statusMsg
+                          : 'Process & Export'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: AppColors.accent,
+                        foregroundColor: Colors.white,
+                        disabledBackgroundColor: AppColors.surface2,
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                      onPressed: clipCount == 0 ? null : onExport,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+
+                  // ── Status ─────────────────────────────────────────────────
+                  if (proc.stage != _Stage.idle)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: _StatusArea(proc: proc, onReset: onReset),
+                    ),
+                  const SizedBox(height: 8),
+                ],
               ),
-              onPressed: clipCount == 0 ? null : onExport,
             ),
           ),
-          if (proc.stage != _Stage.idle) ...[
-            const SizedBox(height: 12),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: _StatusArea(proc: proc, onReset: onReset),
-            ),
-          ],
-          const Divider(color: AppColors.border, height: 24),
-          _section('Log'),
+
+          const Divider(color: AppColors.border, height: 1),
+
+          // ── Log (fixed at bottom, takes remaining space) ───────────────────
+          _sectionHeader('Log'),
           Expanded(
             child: Container(
-              margin: const EdgeInsets.symmetric(horizontal: 16),
+              margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
               padding: const EdgeInsets.all(10),
               decoration: BoxDecoration(
                 color: const Color(0xFF0D0D0D),
@@ -622,41 +629,30 @@ class _RightPanel extends StatelessWidget {
               ),
               child: proc.logs.isEmpty
                   ? const Center(
-                      child: Text(
-                        'Processing log will appear here.',
-                        style: TextStyle(color: AppColors.muted, fontSize: 11),
-                      ),
-                    )
+                      child: Text('Processing log will appear here.',
+                          style: TextStyle(color: AppColors.muted, fontSize: 11)))
                   : ListView.builder(
                       controller: logScroll,
                       itemCount: proc.logs.length,
                       itemBuilder: (_, i) => Text(
                         proc.logs[i],
                         style: const TextStyle(
-                          color: Color(0xFF88CC88),
-                          fontSize: 10,
-                          fontFamily: 'monospace',
-                        ),
+                            color: Color(0xFF88CC88), fontSize: 10, fontFamily: 'monospace'),
                       ),
                     ),
             ),
           ),
-          const SizedBox(height: 16),
         ],
       ),
     );
   }
 
-  Widget _section(String title) => Padding(
-        padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+  Widget _sectionHeader(String title) => Padding(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
         child: Text(
           title.toUpperCase(),
           style: const TextStyle(
-            color: AppColors.muted,
-            fontSize: 11,
-            fontWeight: FontWeight.w600,
-            letterSpacing: 1,
-          ),
+              color: AppColors.muted, fontSize: 11, fontWeight: FontWeight.w600, letterSpacing: 1),
         ),
       );
 
@@ -697,12 +693,407 @@ class _RightPanel extends StatelessWidget {
       );
 }
 
+// ── Subtitle panel ────────────────────────────────────────────────────────────
+
+class _SubtitlePanel extends StatefulWidget {
+  final SubtitleOptions options;
+  final ValueChanged<SubtitleOptions> onChanged;
+  const _SubtitlePanel({required this.options, required this.onChanged});
+
+  @override
+  State<_SubtitlePanel> createState() => _SubtitlePanelState();
+}
+
+class _SubtitlePanelState extends State<_SubtitlePanel> {
+  bool _expanded = false;
+
+  SubtitleOptions get _o => widget.options;
+  void _update(SubtitleOptions next) => widget.onChanged(next);
+
+  static const _fontColors = {
+    'White': Color(0xFFFFFFFF),
+    'Yellow': Color(0xFFFFFF00),
+    'Cyan': Color(0xFF00FFFF),
+    'Black': Color(0xFF000000),
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // ── Header row with enable toggle ──────────────────────────────────
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Row(
+            children: [
+              // Section label
+              const Text(
+                'SUBTITLES',
+                style: TextStyle(
+                    color: AppColors.muted,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 1),
+              ),
+              const SizedBox(width: 8),
+              // Enable toggle
+              Transform.scale(
+                scale: 0.75,
+                child: Switch(
+                  value: _o.enabled,
+                  onChanged: (v) {
+                    _update(_o.copyWith(enabled: v));
+                    if (v) setState(() => _expanded = true);
+                  },
+                  activeThumbColor: AppColors.accent,
+                ),
+              ),
+              const Spacer(),
+              if (_o.enabled)
+                IconButton(
+                  icon: Icon(
+                    _expanded ? Icons.expand_less : Icons.expand_more,
+                    color: AppColors.muted,
+                    size: 18,
+                  ),
+                  onPressed: () => setState(() => _expanded = !_expanded),
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(),
+                ),
+            ],
+          ),
+        ),
+
+        if (_o.enabled && _expanded) ...[
+          const SizedBox(height: 8),
+
+          // ── Language ────────────────────────────────────────────────────
+          _row(
+            label: 'Language',
+            child: _segmented(
+              values: SubtitleLanguage.values,
+              current: _o.language,
+              label: (l) => l.label,
+              onSelect: (l) => _update(_o.copyWith(language: l)),
+            ),
+          ),
+
+          const SizedBox(height: 10),
+
+          // ── Whisper model ────────────────────────────────────────────────
+          _row(
+            label: 'Model',
+            child: DropdownButton<WhisperModel>(
+              value: _o.model,
+              dropdownColor: AppColors.surface2,
+              style: const TextStyle(color: Colors.white, fontSize: 12),
+              underline: const SizedBox(),
+              isDense: true,
+              onChanged: (m) => m != null ? _update(_o.copyWith(model: m)) : null,
+              items: WhisperModel.values
+                  .map((m) => DropdownMenuItem(
+                        value: m,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(m.label,
+                                style: const TextStyle(color: Colors.white, fontSize: 12)),
+                            Text(m.description,
+                                style: const TextStyle(
+                                    color: AppColors.muted, fontSize: 10)),
+                          ],
+                        ),
+                      ))
+                  .toList(),
+            ),
+          ),
+
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Text(
+              'STYLE',
+              style: TextStyle(
+                  color: AppColors.border,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 1),
+            ),
+          ),
+
+          // ── Font size ────────────────────────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text('Font size',
+                        style: TextStyle(color: AppColors.subtle, fontSize: 12)),
+                    Text('${_o.style.fontSize.round()} pt',
+                        style: const TextStyle(
+                            color: AppColors.accent,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600)),
+                  ],
+                ),
+                SliderTheme(
+                  data: const SliderThemeData(
+                    activeTrackColor: AppColors.accent,
+                    thumbColor: AppColors.accent,
+                    inactiveTrackColor: AppColors.border,
+                    trackHeight: 2,
+                    thumbShape: RoundSliderThumbShape(enabledThumbRadius: 6),
+                  ),
+                  child: Slider(
+                    value: _o.style.fontSize,
+                    min: 14,
+                    max: 56,
+                    divisions: 21,
+                    onChanged: (v) =>
+                        _update(_o.copyWith(style: _o.style.copyWith(fontSize: v))),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // ── Font color ───────────────────────────────────────────────────
+          _row(
+            label: 'Font color',
+            child: Row(
+              children: _fontColors.entries.map((e) {
+                final selected = _o.style.fontColor == e.value;
+                return Padding(
+                  padding: const EdgeInsets.only(right: 6),
+                  child: GestureDetector(
+                    onTap: () =>
+                        _update(_o.copyWith(style: _o.style.copyWith(fontColor: e.value))),
+                    child: Tooltip(
+                      message: e.key,
+                      child: Container(
+                        width: 22,
+                        height: 22,
+                        decoration: BoxDecoration(
+                          color: e.value,
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: selected ? AppColors.accent : AppColors.border,
+                            width: selected ? 2.5 : 1,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
+
+          const SizedBox(height: 10),
+
+          // ── Background ───────────────────────────────────────────────────
+          _row(
+            label: 'Background',
+            child: Row(
+              children: [
+                Transform.scale(
+                  scale: 0.75,
+                  child: Switch(
+                    value: _o.style.hasBackground,
+                    onChanged: (v) => _update(
+                        _o.copyWith(style: _o.style.copyWith(hasBackground: v))),
+                    activeThumbColor: AppColors.accent,
+                  ),
+                ),
+                if (_o.style.hasBackground) ...[
+                  Expanded(
+                    child: SliderTheme(
+                      data: const SliderThemeData(
+                        activeTrackColor: AppColors.accent,
+                        thumbColor: AppColors.accent,
+                        inactiveTrackColor: AppColors.border,
+                        trackHeight: 2,
+                        thumbShape: RoundSliderThumbShape(enabledThumbRadius: 5),
+                      ),
+                      child: Slider(
+                        value: _o.style.backgroundOpacity,
+                        min: 0.1,
+                        max: 1.0,
+                        onChanged: (v) => _update(
+                            _o.copyWith(style: _o.style.copyWith(backgroundOpacity: v))),
+                      ),
+                    ),
+                  ),
+                  Text(
+                    '${(_o.style.backgroundOpacity * 100).round()}%',
+                    style: const TextStyle(color: AppColors.subtle, fontSize: 11),
+                  ),
+                ],
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 8),
+
+          // ── Outline ──────────────────────────────────────────────────────
+          _row(
+            label: 'Outline',
+            child: Transform.scale(
+              scale: 0.75,
+              alignment: Alignment.centerLeft,
+              child: Switch(
+                value: _o.style.hasOutline,
+                onChanged: (v) =>
+                    _update(_o.copyWith(style: _o.style.copyWith(hasOutline: v))),
+                activeThumbColor: AppColors.accent,
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 8),
+
+          // ── Position ─────────────────────────────────────────────────────
+          _row(
+            label: 'Position',
+            child: _segmented(
+              values: SubtitlePosition.values,
+              current: _o.style.position,
+              label: (p) => p.label,
+              onSelect: (p) =>
+                  _update(_o.copyWith(style: _o.style.copyWith(position: p))),
+            ),
+          ),
+
+          const SizedBox(height: 10),
+
+          // ── Export SRT ───────────────────────────────────────────────────
+          _row(
+            label: 'Export .srt',
+            child: Transform.scale(
+              scale: 0.75,
+              alignment: Alignment.centerLeft,
+              child: Switch(
+                value: _o.exportSrt,
+                onChanged: (v) => _update(_o.copyWith(exportSrt: v)),
+                activeThumbColor: AppColors.accent,
+              ),
+            ),
+          ),
+
+          // ── Preview chip ─────────────────────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            child: _SubtitlePreview(style: _o.style),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _row({required String label, required Widget child}) => Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 88,
+              child: Text(label, style: const TextStyle(color: AppColors.subtle, fontSize: 12)),
+            ),
+            Expanded(child: child),
+          ],
+        ),
+      );
+
+  Widget _segmented<T>({
+    required List<T> values,
+    required T current,
+    required String Function(T) label,
+    required ValueChanged<T> onSelect,
+  }) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: values.map((v) {
+        final selected = v == current;
+        return GestureDetector(
+          onTap: () => onSelect(v),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            margin: const EdgeInsets.only(right: 4),
+            decoration: BoxDecoration(
+              color: selected ? AppColors.accent : AppColors.surface2,
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: selected ? AppColors.accent : AppColors.border),
+            ),
+            child: Text(
+              label(v),
+              style: TextStyle(
+                color: selected ? Colors.white : AppColors.subtle,
+                fontSize: 11,
+                fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+              ),
+            ),
+          ),
+        );
+      }).toList(),
+    );
+  }
+}
+
+// ── Subtitle preview chip ─────────────────────────────────────────────────────
+
+class _SubtitlePreview extends StatelessWidget {
+  final SubtitleStyle style;
+  const _SubtitlePreview({required this.style});
+
+  @override
+  Widget build(BuildContext context) {
+    final bg = style.hasBackground
+        ? Colors.black.withAlpha((style.backgroundOpacity * 255).round())
+        : Colors.transparent;
+    final shadow = style.hasOutline
+        ? [Shadow(color: Colors.black, blurRadius: 2, offset: const Offset(1, 1))]
+        : <Shadow>[];
+
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF0A0A0A),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: AppColors.border),
+      ),
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          const Text('Preview', style: TextStyle(color: AppColors.muted, fontSize: 10)),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            color: bg,
+            child: Text(
+              'Bonjour, bienvenue !',
+              style: TextStyle(
+                color: style.fontColor,
+                fontSize: (style.fontSize * 0.55).clamp(10, 26),
+                shadows: shadow,
+                fontWeight: FontWeight.normal,
+              ),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 // ── Status area ───────────────────────────────────────────────────────────────
 
 class _StatusArea extends StatelessWidget {
   final _ProcessingState proc;
   final VoidCallback onReset;
-
   const _StatusArea({required this.proc, required this.onReset});
 
   @override
@@ -723,24 +1114,18 @@ class _StatusArea extends StatelessWidget {
           minHeight: 4,
         ),
         const SizedBox(height: 6),
-        Text(
-          proc.statusMsg,
-          style: TextStyle(color: color, fontSize: 12),
-        ),
+        Text(proc.statusMsg, style: TextStyle(color: color, fontSize: 12)),
         if (proc.stage == _Stage.done && proc.outputPath != null) ...[
           const SizedBox(height: 8),
           GestureDetector(
             onTap: () => Process.run('open', ['-R', proc.outputPath!]),
-            child: const Text(
-              'Reveal in Finder',
-              style: TextStyle(
-                color: AppColors.accent,
-                fontSize: 12,
-                decoration: TextDecoration.underline,
-              ),
-            ),
+            child: const Text('Reveal in Finder',
+                style: TextStyle(
+                    color: AppColors.accent,
+                    fontSize: 12,
+                    decoration: TextDecoration.underline)),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
           TextButton(
             onPressed: onReset,
             child: const Text('Reset', style: TextStyle(color: AppColors.muted, fontSize: 12)),
@@ -750,7 +1135,8 @@ class _StatusArea extends StatelessWidget {
           const SizedBox(height: 8),
           TextButton(
             onPressed: onReset,
-            child: const Text('Dismiss', style: TextStyle(color: AppColors.muted, fontSize: 12)),
+            child:
+                const Text('Dismiss', style: TextStyle(color: AppColors.muted, fontSize: 12)),
           ),
         ],
       ],

@@ -3,9 +3,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/project.dart';
 import '../services/ffmpeg_service.dart';
 import '../services/storage_service.dart';
+import '../services/whisper_service.dart';
 
 final storageServiceProvider = Provider<StorageService>((_) => StorageService());
 final ffmpegServiceProvider = Provider<FfmpegService>((_) => FfmpegService());
+final whisperServiceProvider = Provider<WhisperService>((_) => WhisperService());
 
 class ProjectsNotifier extends AsyncNotifier<List<Project>> {
   @override

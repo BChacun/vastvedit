@@ -1,7 +1,8 @@
-import 'dart:async';
 import 'dart:io';
 
 import '../models/project.dart';
+import '../models/subtitle_options.dart';
+import 'whisper_service.dart';
 
 typedef VideoInterval = (double start, double end);
 
@@ -25,6 +26,8 @@ class FfmpegService {
     return _ffprobePath = 'ffprobe';
   }
 
+  // ── Probe ─────────────────────────────────────────────────────────────────
+
   Future<double> getVideoDuration(String path) async {
     final probe = await ffprobePath;
     final result = await Process.run(probe, [
@@ -35,6 +38,8 @@ class FfmpegService {
     ]);
     return double.tryParse(result.stdout.toString().trim()) ?? 0.0;
   }
+
+  // ── Silence detection ─────────────────────────────────────────────────────
 
   Future<List<VideoInterval>> detectSilence(
     String path, {
@@ -68,7 +73,6 @@ class FfmpegService {
       }
     }
 
-    // clip ends in silence
     if (start != null) {
       final s = start;
       final duration = await getVideoDuration(path);
@@ -83,7 +87,6 @@ class FfmpegService {
     double duration,
     double padding,
   ) {
-    // Shrink each silence interval by padding on each side so we keep a bit of context around speech.
     final padded = silentIntervals
         .map((si) => (si.$1 + padding, si.$2 - padding))
         .where((si) => si.$2 > si.$1)
@@ -99,9 +102,10 @@ class FfmpegService {
     }
     if (pos < duration - 0.05) nonSilent.add((pos, duration));
 
-    // Drop segments shorter than 50 ms to avoid tiny glitches
     return nonSilent.where((ni) => ni.$2 - ni.$1 >= 0.05).toList();
   }
+
+  // ── Per-clip silence removal ──────────────────────────────────────────────
 
   Future<void> processClip({
     required String inputPath,
@@ -131,18 +135,13 @@ class FfmpegService {
       parts.add('${inputs}concat=n=$n:v=1:a=1[vout][aout]');
     }
 
-    final filterComplex = parts.join(';');
-
     final args = [
       '-i', inputPath,
-      '-filter_complex', filterComplex,
+      '-filter_complex', parts.join(';'),
       '-map', '[vout]',
       '-map', '[aout]',
-      '-c:v', 'libx264',
-      '-crf', '18',
-      '-preset', 'medium',
-      '-c:a', 'aac',
-      '-b:a', '192k',
+      '-c:v', 'libx264', '-crf', '18', '-preset', 'medium',
+      '-c:a', 'aac', '-b:a', '192k',
       '-movflags', '+faststart',
       '-y', outputPath,
     ];
@@ -150,17 +149,15 @@ class FfmpegService {
     onLog?.call('  ffmpeg ${args.join(' ')}');
 
     final process = await Process.start(ff, args);
-
-    // Forward ffmpeg's stderr (progress/info) to the log callback
     process.stderr
         .transform(const SystemEncoding().decoder)
-        .listen((chunk) => onLog?.call(chunk.trim()));
+        .listen((c) => onLog?.call(c.trim()));
 
-    final exitCode = await process.exitCode;
-    if (exitCode != 0) {
-      throw Exception('ffmpeg exited with code $exitCode while processing $inputPath');
-    }
+    final code = await process.exitCode;
+    if (code != 0) throw Exception('ffmpeg failed (code $code) on $inputPath');
   }
+
+  // ── Concat ────────────────────────────────────────────────────────────────
 
   Future<void> concatClips({
     required List<String> clipPaths,
@@ -168,18 +165,16 @@ class FfmpegService {
     void Function(String)? onLog,
   }) async {
     final ff = await ffmpegPath;
-    final concatFile = '${Directory.systemTemp.path}/vastvedit_concat_${DateTime.now().millisecondsSinceEpoch}.txt';
+    final listFile =
+        '${Directory.systemTemp.path}/vastvedit_concat_${DateTime.now().millisecondsSinceEpoch}.txt';
 
-    await File(concatFile).writeAsString(
+    await File(listFile).writeAsString(
       clipPaths.map((p) => "file '${p.replaceAll("'", "'\\''")}'").join('\n'),
     );
 
-    onLog?.call('Concat list written to $concatFile');
-
     final args = [
-      '-f', 'concat',
-      '-safe', '0',
-      '-i', concatFile,
+      '-f', 'concat', '-safe', '0',
+      '-i', listFile,
       '-c', 'copy',
       '-movflags', '+faststart',
       '-y', outputPath,
@@ -190,15 +185,58 @@ class FfmpegService {
     final process = await Process.start(ff, args);
     process.stderr
         .transform(const SystemEncoding().decoder)
-        .listen((chunk) => onLog?.call(chunk.trim()));
+        .listen((c) => onLog?.call(c.trim()));
 
-    final exitCode = await process.exitCode;
-    await File(concatFile).delete().catchError((_) => File(concatFile));
-
-    if (exitCode != 0) {
-      throw Exception('ffmpeg concat exited with code $exitCode');
-    }
+    final code = await process.exitCode;
+    await File(listFile).delete().catchError((_) => File(listFile));
+    if (code != 0) throw Exception('ffmpeg concat failed (code $code)');
   }
+
+  // ── Subtitle burning ──────────────────────────────────────────────────────
+
+  /// Burns an SRT subtitle file into [inputPath] and writes the result to [outputPath].
+  ///
+  /// The SRT is first copied to a simple path under [tmpDir] so that special
+  /// characters (spaces, colons) in the original path don't trip up ffmpeg's
+  /// filter-string parser.
+  Future<void> burnSubtitles({
+    required String inputPath,
+    required String srtPath,
+    required String outputPath,
+    required String tmpDir,
+    required SubtitleStyle style,
+    void Function(String)? onLog,
+  }) async {
+    final ff = await ffmpegPath;
+
+    // Use a clean temp path — avoids escaping headaches with special chars
+    final safeSrt = '$tmpDir/subs_${DateTime.now().millisecondsSinceEpoch}.srt';
+    await File(srtPath).copy(safeSrt);
+
+    final forceStyle = style.toForceStyle();
+
+    final args = [
+      '-i', inputPath,
+      '-vf', "subtitles='$safeSrt':force_style='$forceStyle'",
+      '-c:v', 'libx264', '-crf', '18', '-preset', 'medium',
+      '-c:a', 'copy',
+      '-movflags', '+faststart',
+      '-y', outputPath,
+    ];
+
+    onLog?.call('ffmpeg ${args.join(' ')}');
+
+    final process = await Process.start(ff, args);
+    process.stderr
+        .transform(const SystemEncoding().decoder)
+        .listen((c) => onLog?.call(c.trim()));
+
+    final code = await process.exitCode;
+    await File(safeSrt).delete().catchError((_) => File(safeSrt));
+    if (code != 0) throw Exception('ffmpeg subtitle burn failed (code $code)');
+  }
+
+  // ── Full project pipeline ─────────────────────────────────────────────────
 
   Future<void> processProject({
     required Project project,
@@ -206,24 +244,33 @@ class FfmpegService {
     required double silenceThreshold,
     required double minSilenceDuration,
     required double padding,
+    SubtitleOptions? subtitles,
+    WhisperService? whisperService,
     void Function(String)? onLog,
     void Function(double)? onProgress,
-    void Function()? isCancelled,
   }) async {
-    final tmpDir = Directory(
-      '${Directory.systemTemp.path}/vastvedit_${project.id}_${DateTime.now().millisecondsSinceEpoch}',
-    );
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final tmpDir = Directory('${Directory.systemTemp.path}/vastvedit_${project.id}_$stamp');
     await tmpDir.create(recursive: true);
 
+    // When subtitles are enabled we need a separate rough-cut path so we can
+    // burn subs on top as a second pass.
+    final needsSubtitlePass = subtitles != null && subtitles.enabled;
+    final roughCutPath = needsSubtitlePass ? '${tmpDir.path}/rough_cut.mp4' : outputPath;
+
     try {
+      // ── Phase 1: per-clip silence removal ──────────────────────────────────
       final processedPaths = <String>[];
       final clips = project.clips;
       final total = clips.length;
+      // Silence removal = 0 → 80 % of progress bar
+      // (subtitle phase gets the remaining 20 %)
+      final silenceShare = needsSubtitlePass ? 0.75 : 0.85;
 
       for (int i = 0; i < total; i++) {
         final clip = clips[i];
         onLog?.call('\n── Clip ${i + 1}/$total: ${clip.name}');
-        onProgress?.call(i / total * 0.85);
+        onProgress?.call(i / total * silenceShare);
 
         if (!await File(clip.filePath).exists()) {
           throw Exception('File not found: ${clip.filePath}');
@@ -232,15 +279,16 @@ class FfmpegService {
         final duration = await getVideoDuration(clip.filePath);
         onLog?.call('  Duration: ${_fmt(duration)}');
 
-        onLog?.call('  Detecting silence (threshold: ${silenceThreshold}dB, min: ${minSilenceDuration}s)…');
-        final silentIntervals = await detectSilence(
+        onLog?.call(
+            '  Detecting silence (threshold: ${silenceThreshold}dB, min: ${minSilenceDuration}s)…');
+        final silent = await detectSilence(
           clip.filePath,
           threshold: silenceThreshold,
           minDuration: minSilenceDuration,
         );
-        onLog?.call('  Found ${silentIntervals.length} silent interval(s).');
+        onLog?.call('  Found ${silent.length} silent interval(s).');
 
-        final nonSilent = computeNonSilentIntervals(silentIntervals, duration, padding);
+        final nonSilent = computeNonSilentIntervals(silent, duration, padding);
         onLog?.call('  Non-silent segments: ${nonSilent.length}');
 
         if (nonSilent.isEmpty) {
@@ -264,21 +312,60 @@ class FfmpegService {
         throw Exception('All clips were silent — nothing to export.');
       }
 
+      // ── Phase 2: stitch ────────────────────────────────────────────────────
       onLog?.call('\n── Stitching ${processedPaths.length} clip(s)…');
-      onProgress?.call(0.9);
+      onProgress?.call(needsSubtitlePass ? 0.78 : 0.88);
 
       if (processedPaths.length == 1) {
-        await File(processedPaths.first).copy(outputPath);
+        await File(processedPaths.first).copy(roughCutPath);
       } else {
-        await concatClips(clipPaths: processedPaths, outputPath: outputPath, onLog: onLog);
+        await concatClips(clipPaths: processedPaths, outputPath: roughCutPath, onLog: onLog);
+      }
+
+      // ── Phase 3: subtitles (optional) ─────────────────────────────────────
+      if (needsSubtitlePass && whisperService != null) {
+        onLog?.call('\n── Transcribing audio (${subtitles.model.label} · ${subtitles.language.label})…');
+        onProgress?.call(0.82);
+
+        final srtPath = await whisperService.transcribe(
+          inputPath: roughCutPath,
+          language: subtitles.language.code,
+          model: subtitles.model.id,
+          outputDir: tmpDir.path,
+          onLog: onLog,
+        );
+        onLog?.call('  SRT: $srtPath');
+
+        // Optionally copy the SRT next to the output video
+        if (subtitles.exportSrt) {
+          final srtDest = outputPath.replaceAll(RegExp(r'\.[^.]+$'), '.srt');
+          await File(srtPath).copy(srtDest);
+          onLog?.call('  SRT exported → $srtDest');
+        }
+
+        onLog?.call('  Burning subtitles…');
+        onProgress?.call(0.92);
+
+        await burnSubtitles(
+          inputPath: roughCutPath,
+          srtPath: srtPath,
+          outputPath: outputPath,
+          tmpDir: tmpDir.path,
+          style: subtitles.style,
+          onLog: onLog,
+        );
+
+        await File(roughCutPath).delete().catchError((_) => File(roughCutPath));
       }
 
       onProgress?.call(1.0);
-      onLog?.call('\n✓ Export complete: $outputPath');
+      onLog?.call('\n✓ Export complete → $outputPath');
     } finally {
       await tmpDir.delete(recursive: true).catchError((_) => tmpDir);
     }
   }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
 
   String _fmt(double seconds) {
     final m = (seconds ~/ 60).toString().padLeft(2, '0');
