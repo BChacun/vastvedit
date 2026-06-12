@@ -8,6 +8,7 @@ import 'package:uuid/uuid.dart';
 import '../models/project.dart';
 import '../models/subtitle_options.dart';
 import '../providers/projects_provider.dart';
+import '../services/whisper_service.dart';
 import 'home_screen.dart';
 
 // ── Processing state ──────────────────────────────────────────────────────────
@@ -328,6 +329,7 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen> {
               // subtitles
               subtitles: _subtitles,
               onSubtitlesChanged: (s) => setState(() => _subtitles = s),
+              whisperService: ref.read(whisperServiceProvider),
               // processing
               proc: _proc,
               onExport: _proc.stage == _Stage.processing ? null : _processAndExport,
@@ -503,6 +505,7 @@ class _RightPanel extends StatefulWidget {
 
   final SubtitleOptions subtitles;
   final ValueChanged<SubtitleOptions> onSubtitlesChanged;
+  final WhisperService whisperService;
 
   final _ProcessingState proc;
   final VoidCallback? onExport;
@@ -519,6 +522,7 @@ class _RightPanel extends StatefulWidget {
     required this.onPaddingChanged,
     required this.subtitles,
     required this.onSubtitlesChanged,
+    required this.whisperService,
     required this.proc,
     required this.onExport,
     required this.onReset,
@@ -593,6 +597,7 @@ class _RightPanelState extends State<_RightPanel> {
                   _SubtitlePanel(
                     options: w.subtitles,
                     onChanged: w.onSubtitlesChanged,
+                    whisperService: w.whisperService,
                   ),
 
                   const Divider(color: AppColors.border, height: 20),
@@ -720,7 +725,13 @@ class _RightPanelState extends State<_RightPanel> {
 class _SubtitlePanel extends StatefulWidget {
   final SubtitleOptions options;
   final ValueChanged<SubtitleOptions> onChanged;
-  const _SubtitlePanel({required this.options, required this.onChanged});
+  final WhisperService whisperService;
+
+  const _SubtitlePanel({
+    required this.options,
+    required this.onChanged,
+    required this.whisperService,
+  });
 
   @override
   State<_SubtitlePanel> createState() => _SubtitlePanelState();
@@ -728,6 +739,8 @@ class _SubtitlePanel extends StatefulWidget {
 
 class _SubtitlePanelState extends State<_SubtitlePanel> {
   bool _expanded = false;
+  // null = still checking, true = installed, false = not found
+  bool? _whisperAvailable;
 
   SubtitleOptions get _o => widget.options;
   void _update(SubtitleOptions next) => widget.onChanged(next);
@@ -740,16 +753,66 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
   };
 
   @override
+  void initState() {
+    super.initState();
+    _checkWhisper();
+  }
+
+  Future<void> _checkWhisper() async {
+    final available = await widget.whisperService.isAvailable;
+    if (mounted) setState(() => _whisperAvailable = available);
+  }
+
+  // Called when the user flips the subtitle toggle ON.
+  Future<void> _onToggleOn() async {
+    // If we already know it's installed, just enable.
+    if (_whisperAvailable == true) {
+      _update(_o.copyWith(enabled: true));
+      setState(() => _expanded = true);
+      return;
+    }
+
+    // Still checking — wait for the result first.
+    if (_whisperAvailable == null) {
+      final available = await widget.whisperService.isAvailable;
+      if (mounted) setState(() => _whisperAvailable = available);
+      if (available) {
+        _update(_o.copyWith(enabled: true));
+        if (mounted) setState(() => _expanded = true);
+        return;
+      }
+    }
+
+    // Not installed — show install dialog.
+    if (!mounted) return;
+    final installed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => _WhisperInstallDialog(service: widget.whisperService),
+    );
+
+    if (installed == true && mounted) {
+      setState(() {
+        _whisperAvailable = true;
+        _expanded = true;
+      });
+      _update(_o.copyWith(enabled: true));
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final checking = _whisperAvailable == null;
+    final notInstalled = _whisperAvailable == false;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // ── Header row with enable toggle ──────────────────────────────────
+        // ── Header row ───────────────────────────────────────────────────────
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: Row(
             children: [
-              // Section label
               const Text(
                 'SUBTITLES',
                 style: TextStyle(
@@ -758,15 +821,39 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
                     fontWeight: FontWeight.w600,
                     letterSpacing: 1),
               ),
-              const SizedBox(width: 8),
-              // Enable toggle
+              const SizedBox(width: 6),
+
+              // Whisper status badge
+              if (checking)
+                const SizedBox(
+                  width: 10,
+                  height: 10,
+                  child: CircularProgressIndicator(strokeWidth: 1.5, color: AppColors.muted),
+                )
+              else if (notInstalled)
+                Tooltip(
+                  message: 'openai-whisper not installed — toggle on to install',
+                  child: Icon(Icons.warning_amber_rounded,
+                      size: 14, color: AppColors.warning),
+                )
+              else if (_whisperAvailable == true)
+                Tooltip(
+                  message: 'openai-whisper is installed',
+                  child: Icon(Icons.check_circle_outline,
+                      size: 14, color: AppColors.success),
+                ),
+
+              const SizedBox(width: 4),
               Transform.scale(
                 scale: 0.75,
                 child: Switch(
                   value: _o.enabled,
                   onChanged: (v) {
-                    _update(_o.copyWith(enabled: v));
-                    if (v) setState(() => _expanded = true);
+                    if (v) {
+                      _onToggleOn();
+                    } else {
+                      _update(_o.copyWith(enabled: false));
+                    }
                   },
                   activeThumbColor: AppColors.accent,
                 ),
@@ -787,10 +874,10 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
           ),
         ),
 
+        // ── Expanded settings ─────────────────────────────────────────────
         if (_o.enabled && _expanded) ...[
           const SizedBox(height: 8),
 
-          // ── Language ────────────────────────────────────────────────────
           _row(
             label: 'Language',
             child: _segmented(
@@ -803,7 +890,6 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
 
           const SizedBox(height: 10),
 
-          // ── Whisper model ────────────────────────────────────────────────
           _row(
             label: 'Model',
             child: DropdownButton<WhisperModel>(
@@ -823,8 +909,7 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
                             Text(m.label,
                                 style: const TextStyle(color: Colors.white, fontSize: 12)),
                             Text(m.description,
-                                style: const TextStyle(
-                                    color: AppColors.muted, fontSize: 10)),
+                                style: const TextStyle(color: AppColors.muted, fontSize: 10)),
                           ],
                         ),
                       ))
@@ -834,17 +919,15 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
 
           const Padding(
             padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Text(
-              'STYLE',
-              style: TextStyle(
-                  color: AppColors.border,
-                  fontSize: 10,
-                  fontWeight: FontWeight.w600,
-                  letterSpacing: 1),
-            ),
+            child: Text('STYLE',
+                style: TextStyle(
+                    color: AppColors.border,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 1)),
           ),
 
-          // ── Font size ────────────────────────────────────────────────────
+          // Font size
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Column(
@@ -857,9 +940,7 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
                         style: TextStyle(color: AppColors.subtle, fontSize: 12)),
                     Text('${_o.style.fontSize.round()} pt',
                         style: const TextStyle(
-                            color: AppColors.accent,
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600)),
+                            color: AppColors.accent, fontSize: 12, fontWeight: FontWeight.w600)),
                   ],
                 ),
                 SliderTheme(
@@ -883,7 +964,7 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
             ),
           ),
 
-          // ── Font color ───────────────────────────────────────────────────
+          // Font color
           _row(
             label: 'Font color',
             child: Row(
@@ -917,7 +998,7 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
 
           const SizedBox(height: 10),
 
-          // ── Background ───────────────────────────────────────────────────
+          // Background
           _row(
             label: 'Background',
             child: Row(
@@ -926,8 +1007,8 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
                   scale: 0.75,
                   child: Switch(
                     value: _o.style.hasBackground,
-                    onChanged: (v) => _update(
-                        _o.copyWith(style: _o.style.copyWith(hasBackground: v))),
+                    onChanged: (v) =>
+                        _update(_o.copyWith(style: _o.style.copyWith(hasBackground: v))),
                     activeThumbColor: AppColors.accent,
                   ),
                 ),
@@ -950,10 +1031,8 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
                       ),
                     ),
                   ),
-                  Text(
-                    '${(_o.style.backgroundOpacity * 100).round()}%',
-                    style: const TextStyle(color: AppColors.subtle, fontSize: 11),
-                  ),
+                  Text('${(_o.style.backgroundOpacity * 100).round()}%',
+                      style: const TextStyle(color: AppColors.subtle, fontSize: 11)),
                 ],
               ],
             ),
@@ -961,7 +1040,7 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
 
           const SizedBox(height: 8),
 
-          // ── Outline ──────────────────────────────────────────────────────
+          // Outline
           _row(
             label: 'Outline',
             child: Transform.scale(
@@ -978,7 +1057,7 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
 
           const SizedBox(height: 8),
 
-          // ── Position ─────────────────────────────────────────────────────
+          // Position
           _row(
             label: 'Position',
             child: _segmented(
@@ -992,7 +1071,7 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
 
           const SizedBox(height: 10),
 
-          // ── Export SRT ───────────────────────────────────────────────────
+          // Export SRT
           _row(
             label: 'Export .srt',
             child: Transform.scale(
@@ -1006,7 +1085,7 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
             ),
           ),
 
-          // ── Preview chip ─────────────────────────────────────────────────
+          // Preview
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
             child: _SubtitlePreview(style: _o.style),
@@ -1034,34 +1113,376 @@ class _SubtitlePanelState extends State<_SubtitlePanel> {
     required T current,
     required String Function(T) label,
     required ValueChanged<T> onSelect,
-  }) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: values.map((v) {
-        final selected = v == current;
-        return GestureDetector(
-          onTap: () => onSelect(v),
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-            margin: const EdgeInsets.only(right: 4),
-            decoration: BoxDecoration(
-              color: selected ? AppColors.accent : AppColors.surface2,
-              borderRadius: BorderRadius.circular(4),
-              border: Border.all(color: selected ? AppColors.accent : AppColors.border),
+  }) =>
+      Row(
+        mainAxisSize: MainAxisSize.min,
+        children: values.map((v) {
+          final sel = v == current;
+          return GestureDetector(
+            onTap: () => onSelect(v),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              margin: const EdgeInsets.only(right: 4),
+              decoration: BoxDecoration(
+                color: sel ? AppColors.accent : AppColors.surface2,
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(color: sel ? AppColors.accent : AppColors.border),
+              ),
+              child: Text(label(v),
+                  style: TextStyle(
+                    color: sel ? Colors.white : AppColors.subtle,
+                    fontSize: 11,
+                    fontWeight: sel ? FontWeight.w600 : FontWeight.normal,
+                  )),
             ),
-            child: Text(
-              label(v),
-              style: TextStyle(
-                color: selected ? Colors.white : AppColors.subtle,
-                fontSize: 11,
-                fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+          );
+        }).toList(),
+      );
+}
+
+// ── Whisper install dialog ────────────────────────────────────────────────────
+
+enum _InstallStage { confirm, installing, done, error }
+
+class _WhisperInstallDialog extends StatefulWidget {
+  final WhisperService service;
+  const _WhisperInstallDialog({required this.service});
+
+  @override
+  State<_WhisperInstallDialog> createState() => _WhisperInstallDialogState();
+}
+
+class _WhisperInstallDialogState extends State<_WhisperInstallDialog> {
+  _InstallStage _stage = _InstallStage.confirm;
+  bool _pipAvailable = true; // assume true until checked
+  final List<String> _log = [];
+  String? _errorMsg;
+  final ScrollController _logScroll = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    _checkPip();
+  }
+
+  @override
+  void dispose() {
+    _logScroll.dispose();
+    super.dispose();
+  }
+
+  Future<void> _checkPip() async {
+    final available = await widget.service.canInstall;
+    if (mounted) setState(() => _pipAvailable = available);
+  }
+
+  void _appendLog(String s) {
+    if (!mounted) return;
+    setState(() => _log.add(s));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_logScroll.hasClients) {
+        _logScroll.jumpTo(_logScroll.position.maxScrollExtent);
+      }
+    });
+  }
+
+  Future<void> _install() async {
+    setState(() {
+      _stage = _InstallStage.installing;
+      _log.clear();
+    });
+    try {
+      await widget.service.install(onOutput: _appendLog);
+      // Verify the binary is now reachable
+      final ok = await widget.service.isAvailable;
+      if (!mounted) return;
+      if (ok) {
+        setState(() => _stage = _InstallStage.done);
+      } else {
+        setState(() {
+          _stage = _InstallStage.error;
+          _errorMsg =
+              'pip reported success but the whisper command was not found.\n'
+              'You may need to restart VastEdit, or add the install location\n'
+              'to your PATH.';
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _stage = _InstallStage.error;
+        _errorMsg = e.toString();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      backgroundColor: AppColors.surface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: SizedBox(
+        width: 480,
+        child: Padding(
+          padding: const EdgeInsets.all(28),
+          child: switch (_stage) {
+            _InstallStage.confirm => _buildConfirm(),
+            _InstallStage.installing => _buildInstalling(),
+            _InstallStage.done => _buildDone(),
+            _InstallStage.error => _buildError(),
+          },
+        ),
+      ),
+    );
+  }
+
+  // ── Confirm ───────────────────────────────────────────────────────────────
+
+  Widget _buildConfirm() => Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: AppColors.accent.withAlpha(30),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Icon(Icons.download_rounded, color: AppColors.accent, size: 28),
+              ),
+              const SizedBox(width: 16),
+              const Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Install openai-whisper',
+                        style: TextStyle(
+                            color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+                    SizedBox(height: 4),
+                    Text('Required for automatic subtitle generation',
+                        style: TextStyle(color: AppColors.muted, fontSize: 12)),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          _infoRow(Icons.mic_outlined, 'What it does',
+              'openai-whisper transcribes speech to text locally on your machine — no internet required after install.'),
+          const SizedBox(height: 12),
+          _infoRow(Icons.storage_outlined, 'Download size',
+              'Package: ~10 MB.  AI model weights are downloaded on first use (e.g. small model: ~250 MB).'),
+          const SizedBox(height: 12),
+          _infoRow(Icons.terminal_outlined, 'How it installs',
+              'Runs:  pip3 install openai-whisper'),
+          if (!_pipAvailable) ...[
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: AppColors.warning.withAlpha(20),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: AppColors.warning.withAlpha(60)),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.warning_amber_rounded, color: AppColors.warning, size: 16),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      'pip3 not found.  Install Python 3 first:\n  brew install python',
+                      style: TextStyle(color: AppColors.warning, fontSize: 11),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+          const SizedBox(height: 28),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('Cancel', style: TextStyle(color: AppColors.muted)),
+              ),
+              const SizedBox(width: 12),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.download_rounded, size: 16),
+                label: const Text('Install'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.accent,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                ),
+                onPressed: _pipAvailable ? _install : null,
+              ),
+            ],
+          ),
+        ],
+      );
+
+  // ── Installing ────────────────────────────────────────────────────────────
+
+  Widget _buildInstalling() => Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.accent),
+              ),
+              SizedBox(width: 14),
+              Text('Installing openai-whisper…',
+                  style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600)),
+            ],
+          ),
+          const SizedBox(height: 6),
+          const Text('This may take a minute. Do not close this window.',
+              style: TextStyle(color: AppColors.muted, fontSize: 12)),
+          const SizedBox(height: 16),
+          Container(
+            height: 200,
+            decoration: BoxDecoration(
+              color: const Color(0xFF0D0D0D),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: AppColors.border),
+            ),
+            padding: const EdgeInsets.all(10),
+            child: ListView.builder(
+              controller: _logScroll,
+              itemCount: _log.length,
+              itemBuilder: (_, i) => Text(
+                _log[i],
+                style: const TextStyle(
+                    color: Color(0xFF88CC88), fontSize: 10, fontFamily: 'monospace'),
               ),
             ),
           ),
-        );
-      }).toList(),
-    );
-  }
+        ],
+      );
+
+  // ── Done ──────────────────────────────────────────────────────────────────
+
+  Widget _buildDone() => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.check_circle_rounded, color: AppColors.success, size: 48),
+          const SizedBox(height: 16),
+          const Text('openai-whisper installed!',
+              style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          const Text(
+            'Subtitles are now enabled.\n'
+            'The AI model weights will download automatically on your first export.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: AppColors.muted, fontSize: 12),
+          ),
+          const SizedBox(height: 24),
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.success,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 12),
+            ),
+            child: const Text('Done'),
+          ),
+        ],
+      );
+
+  // ── Error ─────────────────────────────────────────────────────────────────
+
+  Widget _buildError() => Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.error_outline_rounded, color: AppColors.danger, size: 24),
+              SizedBox(width: 10),
+              Text('Installation failed',
+                  style: TextStyle(
+                      color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600)),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: AppColors.danger.withAlpha(15),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: AppColors.danger.withAlpha(60)),
+            ),
+            child: Text(
+              _errorMsg ?? 'Unknown error',
+              style: const TextStyle(color: AppColors.danger, fontSize: 11, fontFamily: 'monospace'),
+            ),
+          ),
+          const SizedBox(height: 16),
+          const Text('You can install it manually in Terminal:',
+              style: TextStyle(color: AppColors.muted, fontSize: 12)),
+          const SizedBox(height: 6),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFF0D0D0D),
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: AppColors.border),
+            ),
+            child: const SelectableText(
+              'pip3 install openai-whisper',
+              style: TextStyle(color: Color(0xFF88CC88), fontSize: 12, fontFamily: 'monospace'),
+            ),
+          ),
+          const SizedBox(height: 24),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('Close', style: TextStyle(color: AppColors.muted)),
+              ),
+              const SizedBox(width: 12),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.refresh, size: 16),
+                label: const Text('Retry'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.accent,
+                  foregroundColor: Colors.white,
+                ),
+                onPressed: _install,
+              ),
+            ],
+          ),
+        ],
+      );
+
+  Widget _infoRow(IconData icon, String label, String description) => Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, color: AppColors.muted, size: 16),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label,
+                    style: const TextStyle(
+                        color: AppColors.subtle, fontSize: 11, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 2),
+                Text(description,
+                    style: const TextStyle(color: AppColors.muted, fontSize: 11)),
+              ],
+            ),
+          ),
+        ],
+      );
 }
 
 // ── Subtitle preview chip ─────────────────────────────────────────────────────
